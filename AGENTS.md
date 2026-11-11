@@ -4,17 +4,26 @@
 
 - This is a postgraduate Software Engineering with DevOps assignment for a Version Control course. The Git/GitHub collaboration process is central to the assessment.
 - `docs/Avaliacao_Git_GitHub.md` is the source of truth for requirements and acceptance criteria. Use `.github/PULL_REQUEST_TEMPLATE.md` for PRs.
-- The chosen stack is Go for the back end and PostgreSQL for the database. The application, Compose configuration, and test commands have not yet been implemented.
+- The chosen stack is Python 3.12 for the back end and CLI, PostgreSQL 16 for the database, and vanilla JavaScript in the Web page. The application, Compose configuration, and test commands have not yet been implemented.
+- Stack details:
+  - API (`api.py`): FastAPI served by Uvicorn. Keep `/api/web/...` and `/api/cli/...` routes separate; enforce authentication with FastAPI dependencies (HTTP 401); a middleware generates the `request_id`. The API also serves `index.html`.
+  - Database (`db.py`): `psycopg` (v3) with hand-written SQL, no ORM, so Web and CLI keep distinct queries.
+  - CLI (`cli.py`): `argparse` subcommands plus `httpx`; read the token from the `API_TOKEN` environment variable.
+  - Web (`index.html`): vanilla JS with `fetch`; Chart.js from a CDN for the three dashboard charts.
+  - Auth: one initial user configured through `.env` with a hashed password (`bcrypt` or `argon2`); Web login via `POST /api/web/login`, CLI Bearer token via `POST /api/cli/token`. Commit only `.env.example`, never real credentials.
+  - Logs: standard `logging` with a small JSON formatter writing to stdout; propagate `request_id` from the API to `db.py` with `contextvars`.
+  - Tests: `pytest`, `pytest-cov`, and FastAPI `TestClient`, run with `docker compose run --rm tests` against a dedicated test database.
+  - Compose services: `db`, `api`, plus `cli` and `tests` under Compose `profiles` so `docker compose up` starts only the Web/API and database.
 - Write code and code comments in English. Use TDD for development; at the end of every development round, run the tests and ensure they pass and the changes work.
 
 ## Application constraints
 
-- Deliver a Web + CLI CRUD using the same REST API and database. Limit production code to four files: `index.html` with embedded HTML/CSS/JS, one CLI file, one API file, and one database-access file; Go equivalents are allowed. Additional test, dependency, infrastructure, and configuration files are allowed, but each auxiliary file created or changed must be listed and justified in the PR.
+- Deliver a Web + CLI CRUD using the same REST API and database. Limit production code to four files: `index.html` with embedded HTML/CSS/JS, `cli.py`, `api.py`, and `db.py`. Additional test, dependency, infrastructure, and configuration files are allowed, but each auxiliary file created or changed must be listed and justified in the PR.
 - Each main Web PR changes `index.html`, the API, database code, and README; each main CLI PR changes the CLI, API, database code, and README. Add a README section for each main PR's feature; issue #1 documents starting the Web and #7 documents using the CLI. The CLI must not access the database directly; Web and CLI use separate endpoints, and the Web has its own SQL queries. See the assessment for required paths and methods.
 - Functional endpoints require authentication and return HTTP 401 for missing or invalid credentials; healthchecks may be public. The CLI uses a Bearer token and must accept it through an environment variable. Never store plaintext passwords or log secrets.
 - Log each operation as JSON to stdout in the API and, when accessing data, also in the database layer, correlating events with the same `request_id`, including reads. The assessment specifies the required fields.
 - Everything must run exclusively through Docker Compose: `docker compose up` starts the Web, API, and database; CLI, tests, and coverage run in containers. Document complete commands and log access in the README.
-- Each main PR must include unit tests for applicable changes to the CLI, API, and database, maintaining 100% line coverage of all code already integrated in those files; measure only files that exist in early PRs. Corrective PRs changing covered files must preserve tests and coverage. `index.html`, tests, infrastructure, and configuration are excluded. Go's standard coverage reports statements, so verify the required line coverage separately rather than assuming the metrics are identical.
+- Each main PR must include unit tests for applicable changes to the CLI, API, and database, maintaining 100% line coverage of all code already integrated in those files; measure only files that exist in early PRs. Corrective PRs changing covered files must preserve tests and coverage. `index.html`, tests, infrastructure, and configuration are excluded. Measure line coverage with `pytest-cov` over `api.py`, `db.py`, and `cli.py` (only those that exist) and enforce it with `--cov-fail-under=100`; do not use `# pragma: no cover` to reach the target.
 
 ## Integration workflow
 
