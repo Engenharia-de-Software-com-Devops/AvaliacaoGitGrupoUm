@@ -52,6 +52,7 @@ type taskStore interface {
 	updateCLITask(context.Context, int64, task, string) (task, error)
 	listCLITasks(context.Context, cliPageQuery, string) (taskPage, error)
 	searchCLITasks(context.Context, cliSearchQuery, string) (taskPage, error)
+	exportCLITasks(context.Context, cliExportQuery, string) ([]task, error)
 	deleteCLITask(context.Context, int64, string) error
 }
 
@@ -98,6 +99,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/api/cli/records/search":
 		operation = "search"
 		status = s.searchCLIRecords(w, r, id)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/cli/records/export":
+		operation = "export"
+		status = s.exportCLIRecords(w, r, id)
 	case r.Method == http.MethodDelete && cliRecordID(r.URL.Path) > 0:
 		operation = "delete"
 		status = s.deleteCLIRecord(w, r, id, cliRecordID(r.URL.Path))
@@ -387,6 +391,34 @@ func (s *server) searchCLIRecords(w http.ResponseWriter, r *http.Request, reques
 		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
 	}
 	return writeJSON(w, http.StatusOK, result)
+}
+
+// exportCLIRecords answers a CSV with every task matching the CLI search
+// filters, for a CLI holding a valid Bearer token. Paging parameters are
+// ignored, so the file is never limited to one page, and the content uses the
+// same columns and escaping as the web export.
+func (s *server) exportCLIRecords(w http.ResponseWriter, r *http.Request, requestID string) int {
+	if _, ok := s.currentCLIUser(r); !ok {
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+	}
+	values := r.URL.Query()
+	values.Del("page")
+	values.Del("page_size")
+	order, orderOK := parseCLIPageQuery(values)
+	title, priority, status, filtersOK := parseTaskFilters(values)
+	if !orderOK || !filtersOK {
+		return writeError(w, http.StatusBadRequest, "Invalid export parameters")
+	}
+	query := cliExportQuery{Title: title, Priority: priority, Status: status, Sort: order.Sort, Order: order.Order}
+	items, err := s.tasks.exportCLITasks(r.Context(), query, requestID)
+	if err != nil {
+		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="tarefas.csv"`)
+	w.WriteHeader(http.StatusOK)
+	_ = writeTasksCSV(w, items)
+	return http.StatusOK
 }
 
 // deleteCLIRecord deletes one task by id for a CLI holding a valid Bearer token.

@@ -340,6 +340,7 @@ type fakeTasks struct {
 	cliQuery  cliPageQuery
 	cliSearch cliSearchQuery
 	exported  []task
+	cliExport cliExportQuery
 	id        int64
 	err       error
 	requestID string
@@ -406,6 +407,15 @@ func (f *fakeTasks) createCLITask(_ context.Context, input task, requestID strin
 
 func (f *fakeTasks) updateCLITask(_ context.Context, id int64, input task, requestID string) (task, error) {
 	return f.record(id, input, requestID)
+}
+
+func (f *fakeTasks) exportCLITasks(_ context.Context, query cliExportQuery, requestID string) ([]task, error) {
+	f.calls++
+	f.cliExport, f.requestID = query, requestID
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.exported, nil
 }
 
 func (f *fakeTasks) deleteWebTask(_ context.Context, id int64, requestID string) error {
@@ -1098,5 +1108,85 @@ func TestCLITokenDoesNotAuthorizeWebListOrDelete(t *testing.T) {
 		if response.Code != http.StatusUnauthorized || store.calls != 0 {
 			t.Fatalf("%s %s accepted a CLI token: %d", method, path, response.Code)
 		}
+	}
+}
+
+func TestCLITaskExport(t *testing.T) {
+	stored := sampleTask
+	stored.ID = 7
+	tricky := task{ID: 8, Title: `Say "hi", then leave`, Description: "line one\nline two", Priority: "low", Status: "done", DueDate: "2026-12-01", Category: "café"}
+	header := "id,title,description,priority,status,due_date,category\n"
+	for _, tc := range []struct {
+		name, query string
+		items       []task
+		want        cliExportQuery
+		wantCSV     string
+	}{
+		{name: "no filters exports everything", items: []task{stored, tricky}, want: cliExportQuery{Sort: "id", Order: "asc"},
+			wantCSV: header + "7,Write report,Quarterly numbers,high,pending,2026-11-20,work\n" +
+				"8,\"Say \"\"hi\"\", then leave\",\"line one\nline two\",low,done,2026-12-01,café\n"},
+		{name: "combined filters ignore paging", query: "?title=+report+&priority=high&status=pending&sort=due_date&order=desc&page=3&page_size=5", items: []task{stored},
+			want: cliExportQuery{Title: "report", Priority: "high", Status: "pending", Sort: "due_date", Order: "desc"}, wantCSV: header + "7,Write report,Quarterly numbers,high,pending,2026-11-20,work\n"},
+		{name: "no matches keeps the header", query: "?status=done", items: []task{}, want: cliExportQuery{Status: "done", Sort: "id", Order: "asc"}, wantCSV: header},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{exported: tc.items}
+			server, logs := cliTaskServer(store)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, cliTaskRequest(http.MethodGet, "/api/cli/records/export"+tc.query, "", "cli-valid"))
+			if response.Code != http.StatusOK || store.cliExport != tc.want {
+				t.Fatalf("status = %d, query = %+v, want %+v", response.Code, store.cliExport, tc.want)
+			}
+			if response.Header().Get("Content-Type") != "text/csv; charset=utf-8" || response.Header().Get("Content-Disposition") != `attachment; filename="tarefas.csv"` {
+				t.Fatalf("unexpected headers: %v", response.Header())
+			}
+			if response.Body.String() != tc.wantCSV {
+				t.Fatalf("csv = %q, want %q", response.Body.String(), tc.wantCSV)
+			}
+			want := `"layer":"api","client":"cli","operation":"export","status":"success","request_id":"` + store.requestID + `"`
+			if store.requestID == "" || !strings.Contains(logs.String(), want) || strings.Contains(logs.String(), "cli-valid") {
+				t.Fatalf("export API log not correlated or unsafe: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestCLITaskExportFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, query, token string
+		webCookie          bool
+		storeErr           error
+		want               int
+	}{
+		{name: "without token", want: http.StatusUnauthorized},
+		{name: "invalid token", token: "forged", want: http.StatusUnauthorized},
+		{name: "expired token", token: "cli-expired", want: http.StatusUnauthorized},
+		{name: "web session is not a CLI token", webCookie: true, want: http.StatusUnauthorized},
+		{name: "invalid priority", query: "?priority=urgent", token: "cli-valid", want: http.StatusBadRequest},
+		{name: "invalid status", query: "?status=unknown", token: "cli-valid", want: http.StatusBadRequest},
+		{name: "title too long", query: "?title=" + strings.Repeat("a", 101), token: "cli-valid", want: http.StatusBadRequest},
+		{name: "invalid sort", query: "?sort=description", token: "cli-valid", want: http.StatusBadRequest},
+		{name: "invalid order", query: "?order=up", token: "cli-valid", want: http.StatusBadRequest},
+		{name: "store error", token: "cli-valid", storeErr: errors.New("database down"), want: http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{err: tc.storeErr}
+			server, logs := cliTaskServer(store)
+			request := cliTaskRequest(http.MethodGet, "/api/cli/records/export"+tc.query, "", tc.token)
+			if tc.webCookie {
+				request.AddCookie(&http.Cookie{Name: "session", Value: "valid"})
+			}
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, request)
+			if response.Code != tc.want || (store.calls > 0) != (tc.storeErr != nil) {
+				t.Fatalf("status = %d, store calls = %d", response.Code, store.calls)
+			}
+			if strings.HasPrefix(response.Header().Get("Content-Type"), "text/csv") {
+				t.Fatal("failed export answered as CSV")
+			}
+			if !strings.Contains(logs.String(), `"layer":"api","client":"cli","operation":"export","status":"error"`) {
+				t.Fatalf("failure not logged: %s", logs.String())
+			}
+		})
 	}
 }
