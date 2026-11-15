@@ -144,3 +144,79 @@ func (d *database) getWebTask(ctx context.Context, id int64, requestID string) (
 	defer func() { d.logOutcome("select", requestID, "Web task loaded", err) }()
 	return scanTask(d.conn.QueryRowContext(ctx, `SELECT `+webTaskColumns+` FROM tasks WHERE id = $1`, id))
 }
+
+// webPageSize is the fixed number of tasks shown per page in the web table.
+const webPageSize = 5
+
+// webTaskSortColumns maps each sortable web column to its ORDER BY expression.
+// Priority and status sort by their logical rank instead of alphabetically.
+// The API only accepts keys from this map, so no user input reaches the SQL text.
+var webTaskSortColumns = map[string]string{
+	"id":       "id",
+	"title":    "lower(title)",
+	"priority": "CASE priority WHEN 'low' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END",
+	"status":   "CASE status WHEN 'pending' THEN 1 WHEN 'in_progress' THEN 2 ELSE 3 END",
+	"due_date": "due_date",
+}
+
+// taskPageQuery selects one page of the web listing and its ordering.
+type taskPageQuery struct {
+	Page  int
+	Sort  string
+	Order string
+}
+
+// taskPage is one page of tasks plus the totals needed for pagination.
+type taskPage struct {
+	Items      []task `json:"items"`
+	Page       int    `json:"page"`
+	PageSize   int    `json:"page_size"`
+	Total      int    `json:"total"`
+	TotalPages int    `json:"total_pages"`
+}
+
+func (d *database) listWebTasks(ctx context.Context, query taskPageQuery, requestID string) (page taskPage, err error) {
+	defer func() { d.logOutcome("select", requestID, "Web task page loaded", err) }()
+	page = taskPage{Items: []task{}, Page: query.Page, PageSize: webPageSize}
+	if err = d.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks`).Scan(&page.Total); err != nil {
+		return taskPage{}, err
+	}
+	page.TotalPages = (page.Total + webPageSize - 1) / webPageSize
+	direction := "ASC"
+	if query.Order == "desc" {
+		direction = "DESC"
+	}
+	rows, err := d.conn.QueryContext(ctx, `SELECT `+webTaskColumns+` FROM tasks ORDER BY `+webTaskSortColumns[query.Sort]+` `+direction+`, id `+direction+` LIMIT $1 OFFSET $2`,
+		webPageSize, (query.Page-1)*webPageSize)
+	if err != nil {
+		return taskPage{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item task
+		if err = rows.Scan(&item.ID, &item.Title, &item.Description, &item.Priority, &item.Status, &item.DueDate, &item.Category); err != nil {
+			return taskPage{}, err
+		}
+		page.Items = append(page.Items, item)
+	}
+	if err = rows.Err(); err != nil {
+		return taskPage{}, err
+	}
+	return page, nil
+}
+
+func (d *database) deleteWebTask(ctx context.Context, id int64, requestID string) (err error) {
+	defer func() { d.logOutcome("delete", requestID, "Web task deleted", err) }()
+	result, err := d.conn.ExecContext(ctx, `DELETE FROM tasks WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return errTaskNotFound
+	}
+	return nil
+}

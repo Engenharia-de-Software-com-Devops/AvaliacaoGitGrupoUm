@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -196,5 +197,141 @@ func TestDatabaseWebTasks(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func expectDBLog(t *testing.T, logs, operation, status string) {
+	t.Helper()
+	want := `"layer":"db","client":"web","operation":"` + operation + `","status":"` + status + `"`
+	if !strings.Contains(logs, want) || !strings.Contains(logs, `"request_id":"req-list"`) {
+		t.Fatalf("unexpected db log: %s", logs)
+	}
+}
+
+func TestDatabaseWebTaskList(t *testing.T) {
+	first, second := sampleTask, sampleTask
+	first.ID, second.ID, second.Title = 6, 9, "Another task"
+	for _, tc := range []struct {
+		name, sort, order, orderBy, fail string
+		page                             int
+	}{
+		{name: "default order", sort: "id", order: "asc", orderBy: "id ASC, id ASC", page: 1},
+		{name: "title descending", sort: "title", order: "desc", orderBy: "lower(title) DESC, id DESC", page: 2},
+		{name: "priority rank", sort: "priority", order: "asc", orderBy: "CASE priority WHEN 'low' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END ASC, id ASC", page: 1},
+		{name: "status rank", sort: "status", order: "desc", orderBy: "CASE status WHEN 'pending' THEN 1 WHEN 'in_progress' THEN 2 ELSE 3 END DESC, id DESC", page: 1},
+		{name: "due date", sort: "due_date", order: "asc", orderBy: "due_date ASC, id ASC", page: 1},
+		{name: "count fails", sort: "id", order: "asc", page: 1, fail: "count"},
+		{name: "select fails", sort: "id", order: "asc", orderBy: "id ASC, id ASC", page: 1, fail: "select"},
+		{name: "scan fails", sort: "id", order: "asc", orderBy: "id ASC, id ASC", page: 1, fail: "scan"},
+		{name: "row error", sort: "id", order: "asc", orderBy: "id ASC, id ASC", page: 1, fail: "rows"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			count := mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM tasks"))
+			if tc.fail == "count" {
+				count.WillReturnError(errors.New("database unavailable"))
+			} else {
+				count.WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(6))
+				query := mock.ExpectQuery(regexp.QuoteMeta("FROM tasks ORDER BY "+tc.orderBy+" LIMIT $1 OFFSET $2")).WithArgs(5, (tc.page-1)*5)
+				switch tc.fail {
+				case "select":
+					query.WillReturnError(errors.New("database unavailable"))
+				case "scan":
+					query.WillReturnRows(sqlmock.NewRows([]string{"id", "title", "description", "priority", "status", "due_date", "category"}).
+						AddRow("not a number", "x", "", "low", "pending", "2026-11-20", "work"))
+				case "rows":
+					query.WillReturnRows(taskRows(first).RowError(0, errors.New("connection lost")))
+				default:
+					query.WillReturnRows(taskRows(first).AddRow(second.ID, second.Title, second.Description, second.Priority, second.Status, second.DueDate, second.Category))
+				}
+			}
+			var logs bytes.Buffer
+			page, err := (&database{conn: conn, logs: &logs}).listWebTasks(context.Background(), taskPageQuery{Page: tc.page, Sort: tc.sort, Order: tc.order}, "req-list")
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+			if tc.fail != "" {
+				if err == nil {
+					t.Fatal("database failure was not reported")
+				}
+				expectDBLog(t, logs.String(), "select", "error")
+				return
+			}
+			if err != nil || page.Page != tc.page || page.PageSize != 5 || page.Total != 6 || page.TotalPages != 2 {
+				t.Fatalf("page = %+v, %v", page, err)
+			}
+			if len(page.Items) != 2 || page.Items[0] != first || page.Items[1] != second {
+				t.Fatalf("items = %+v", page.Items)
+			}
+			expectDBLog(t, logs.String(), "select", "success")
+		})
+	}
+}
+
+func TestDatabaseWebTaskListEmpty(t *testing.T) {
+	conn, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM tasks")).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectQuery("ORDER BY").WithArgs(5, 0).WillReturnRows(sqlmock.NewRows([]string{"id", "title", "description", "priority", "status", "due_date", "category"}))
+	page, err := (&database{conn: conn, logs: &bytes.Buffer{}}).listWebTasks(context.Background(), taskPageQuery{Page: 1, Sort: "id", Order: "asc"}, "req-list")
+	if err != nil || page.Items == nil || len(page.Items) != 0 || page.TotalPages != 0 {
+		t.Fatalf("empty page = %+v, %v", page, err)
+	}
+}
+
+func TestDatabaseWebTaskDelete(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		result  driver.Result
+		execErr error
+		want    error
+	}{
+		{name: "deleted", result: sqlmock.NewResult(0, 1)},
+		{name: "not found", result: sqlmock.NewResult(0, 0), want: errTaskNotFound},
+		{name: "exec fails", execErr: errors.New("database unavailable")},
+		{name: "rows affected fails", result: sqlmock.NewErrorResult(errors.New("driver failure"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			exec := mock.ExpectExec(regexp.QuoteMeta("DELETE FROM tasks WHERE id = $1")).WithArgs(int64(7))
+			if tc.execErr != nil {
+				exec.WillReturnError(tc.execErr)
+			} else {
+				exec.WillReturnResult(tc.result)
+			}
+			var logs bytes.Buffer
+			err = (&database{conn: conn, logs: &logs}).deleteWebTask(context.Background(), 7, "req-list")
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+			switch {
+			case tc.name == "deleted":
+				if err != nil {
+					t.Fatalf("delete error = %v", err)
+				}
+				expectDBLog(t, logs.String(), "delete", "success")
+			case tc.want != nil:
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("error = %v, want %v", err, tc.want)
+				}
+				expectDBLog(t, logs.String(), "delete", "error")
+			default:
+				if err == nil || errors.Is(err, errTaskNotFound) {
+					t.Fatalf("error = %v, want database failure", err)
+				}
+				expectDBLog(t, logs.String(), "delete", "error")
+			}
+		})
 	}
 }
