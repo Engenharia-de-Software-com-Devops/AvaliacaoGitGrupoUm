@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -420,7 +421,7 @@ func TestDatabaseWebTaskExport(t *testing.T) {
 			defer conn.Close()
 			direction := strings.ToUpper(tc.order)
 			// The export query has no LIMIT/OFFSET: every filtered row is returned.
-			expected := mock.ExpectQuery(regexp.QuoteMeta("FROM tasks "+where+" ORDER BY due_date "+direction+", id "+direction) + "$").WithArgs("report", "high", "")
+			expected := mock.ExpectQuery(regexp.QuoteMeta("FROM tasks "+where+" ORDER BY due_date "+direction+", id "+direction)+"$").WithArgs("report", "high", "")
 			switch tc.fail {
 			case "query":
 				expected.WillReturnError(errors.New("query failure"))
@@ -453,5 +454,92 @@ func TestDatabaseWebTaskExport(t *testing.T) {
 			}
 			expectDBLog(t, logs.String(), "export", "success")
 		})
+	}
+}
+
+func countRows(pairs ...any) *sqlmock.Rows {
+	rows := sqlmock.NewRows([]string{"key", "count"})
+	for i := 0; i < len(pairs); i += 2 {
+		rows.AddRow(pairs[i], pairs[i+1])
+	}
+	return rows
+}
+
+func TestDatabaseWebDashboard(t *testing.T) {
+	statusQuery := regexp.QuoteMeta("AS s(rank, key) LEFT JOIN tasks t ON t.status = s.key")
+	priorityQuery := regexp.QuoteMeta("AS p(rank, key) LEFT JOIN tasks t ON t.priority = p.key")
+	categoryQuery := regexp.QuoteMeta("SELECT category, COUNT(*) FROM tasks GROUP BY category ORDER BY COUNT(*) DESC, category")
+	for _, fail := range []string{"", "status", "priority", "category", "scan", "rows"} {
+		name := fail
+		if name == "" {
+			name = "success"
+		}
+		t.Run(name, func(t *testing.T) {
+			conn, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			status := mock.ExpectQuery(statusQuery)
+			if fail == "status" {
+				status.WillReturnError(errors.New("database unavailable"))
+			} else {
+				status.WillReturnRows(countRows("pending", 3, "in_progress", 1, "done", 2))
+				priority := mock.ExpectQuery(priorityQuery)
+				if fail == "priority" {
+					priority.WillReturnError(errors.New("database unavailable"))
+				} else {
+					priority.WillReturnRows(countRows("low", 0, "medium", 4, "high", 2))
+					category := mock.ExpectQuery(categoryQuery)
+					switch fail {
+					case "category":
+						category.WillReturnError(errors.New("database unavailable"))
+					case "scan":
+						category.WillReturnRows(countRows("work", "many"))
+					case "rows":
+						category.WillReturnRows(countRows("work", 4).RowError(0, errors.New("connection lost")))
+					default:
+						category.WillReturnRows(countRows("work", 4, "home", 2))
+					}
+				}
+			}
+			var logs bytes.Buffer
+			got, err := (&database{conn: conn, logs: &logs}).webDashboard(context.Background(), "req-list")
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+			if fail != "" {
+				if err == nil {
+					t.Fatal("database failure was not reported")
+				}
+				expectDBLog(t, logs.String(), "dashboard", "error")
+				return
+			}
+			want := dashboard{
+				Total:      6,
+				ByStatus:   []countItem{{"pending", 3}, {"in_progress", 1}, {"done", 2}},
+				ByPriority: []countItem{{"low", 0}, {"medium", 4}, {"high", 2}},
+				ByCategory: []countItem{{"work", 4}, {"home", 2}},
+			}
+			if err != nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("dashboard = %+v, %v", got, err)
+			}
+			expectDBLog(t, logs.String(), "dashboard", "success")
+		})
+	}
+}
+
+func TestDatabaseWebDashboardEmpty(t *testing.T) {
+	conn, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	mock.ExpectQuery("t.status").WillReturnRows(countRows("pending", 0, "in_progress", 0, "done", 0))
+	mock.ExpectQuery("t.priority").WillReturnRows(countRows("low", 0, "medium", 0, "high", 0))
+	mock.ExpectQuery("GROUP BY category").WillReturnRows(countRows())
+	got, err := (&database{conn: conn, logs: &bytes.Buffer{}}).webDashboard(context.Background(), "req-list")
+	if err != nil || got.Total != 0 || got.ByCategory == nil || len(got.ByCategory) != 0 {
+		t.Fatalf("empty dashboard = %+v, %v", got, err)
 	}
 }
