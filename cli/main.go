@@ -26,13 +26,19 @@ Commands:
   create [options]       Create a task (requires TODO_TOKEN)
   update <id> [options]  Replace every field of a task (requires TODO_TOKEN)
   list [options]         List tasks one page at a time (requires TODO_TOKEN)
+  search [options]       Search tasks using combinable filters (requires TODO_TOKEN)
   delete <id>            Delete a task by id (requires TODO_TOKEN)
 
-List options:
+List and search options:
   --page N               Page number, starting at 1 (default 1)
   --page-size N          Tasks per page, 1 to 100 (default 10)
   --sort FIELD           id, title, priority, status or due_date (default id)
   --order DIR            asc or desc (default asc)
+
+Search filters (optional, combined with AND):
+  --title TEXT           Literal title substring, case insensitive
+  --priority VALUE       low, medium or high
+  --status VALUE         pending, in_progress or done
 
 Task options, validated by the API with the same rules as the web form:
   --title TEXT           3 to 100 characters (required)
@@ -67,8 +73,8 @@ func run(args []string, getenv func(string) string, client *http.Client, stdout,
 	if args[0] == "create" || args[0] == "update" {
 		return runTask(args, base, getenv("TODO_TOKEN"), client, stdout, stderr)
 	}
-	if args[0] == "list" {
-		return runList(args[1:], base, getenv("TODO_TOKEN"), client, stdout, stderr)
+	if args[0] == "list" || args[0] == "search" {
+		return runList(args[0], args[1:], base, getenv("TODO_TOKEN"), client, stdout, stderr)
 	}
 	if args[0] == "delete" {
 		return runDelete(args[1:], base, getenv("TODO_TOKEN"), client, stdout, stderr)
@@ -242,14 +248,20 @@ func sendAuthorized(client *http.Client, method, address, token string, stderr i
 	return response, 0
 }
 
-// runList prints one page of tasks from GET /api/cli/records as a text table.
-func runList(args []string, base, token string, client *http.Client, stdout, stderr io.Writer) int {
-	flags := flag.NewFlagSet("list", flag.ContinueOnError)
+// runList prints one page from the CLI listing or search endpoint as a text table.
+func runList(command string, args []string, base, token string, client *http.Client, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	page := flags.Int("page", 1, "")
 	pageSize := flags.Int("page-size", 10, "")
 	sortBy := flags.String("sort", "id", "")
 	order := flags.String("order", "asc", "")
+	var title, priority, status string
+	if command == "search" {
+		flags.StringVar(&title, "title", "", "")
+		flags.StringVar(&priority, "priority", "", "")
+		flags.StringVar(&status, "status", "", "")
+	}
 	if flags.Parse(args) != nil || flags.NArg() != 0 {
 		_, _ = io.WriteString(stderr, usage)
 		return 2
@@ -259,13 +271,20 @@ func runList(args []string, base, token string, client *http.Client, stdout, std
 		return 2
 	}
 	query := url.Values{"page": {strconv.Itoa(*page)}, "page_size": {strconv.Itoa(*pageSize)}, "sort": {*sortBy}, "order": {*order}}
-	response, code := sendAuthorized(client, http.MethodGet, base+"/api/cli/records?"+query.Encode(), token, stderr)
+	path := "/api/cli/records"
+	if command == "search" {
+		path += "/search"
+		query.Set("title", title)
+		query.Set("priority", priority)
+		query.Set("status", status)
+	}
+	response, code := sendAuthorized(client, http.MethodGet, base+path+"?"+query.Encode(), token, stderr)
 	if code != 0 {
 		return code
 	}
 	defer response.Body.Close()
 	if response.StatusCode == http.StatusBadRequest {
-		_, _ = io.WriteString(stderr, "Invalid list options: --page from 1, --page-size from 1 to 100, --sort id, title, priority, status or due_date, --order asc or desc.\n")
+		_, _ = fmt.Fprintf(stderr, "Invalid %s options: check filters, --page, --page-size, --sort and --order.\n", command)
 		return 2
 	}
 	if response.StatusCode != http.StatusOK {
