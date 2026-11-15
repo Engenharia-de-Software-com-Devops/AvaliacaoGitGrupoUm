@@ -317,3 +317,70 @@ docker compose --profile test run --build --rm integration
 Os eventos JSON da API usam `client: "cli"`; quando a autenticação consulta o banco, a camada de dados também gera um evento com o mesmo `request_id`. Senhas e tokens não são registrados. Os testes cobrem CLI, API e banco; a verificação de linhas inclui os três arquivos de produção existentes.
 
 O teste de integração da exportação CSV (#5) passou a obter a ordem esperada do próprio PostgreSQL: a collation `en_US.utf8` da imagem ignora pontuação como `%_` ao ordenar, e a comparação byte a byte do Go discordava do banco, fazendo `docker compose --profile test run --build --rm integration` falhar.
+
+## Issue #8 — Cadastro e edição de tarefas (CLI)
+
+Os comandos usam o token obtido na seção **Issue #7**, lido da variável `TODO_TOKEN`; a aplicação precisa estar rodando com `docker compose up --build` em outro terminal. A CLI conversa somente com a API: nunca acessa o banco.
+
+### Cadastrar
+
+```bash
+docker compose --profile cli run --rm --no-deps cli create \
+  --title "Revisar PR da issue #9" \
+  --description "Conferir testes e cobertura" \
+  --priority high \
+  --due-date 2026-11-20 \
+  --category estudos
+```
+
+`--status` é opcional no cadastro e vale `pending` quando omitido, como no formulário Web. Em caso de sucesso, a CLI imprime `Task <id> created.` seguido de todos os campos gravados.
+
+### Editar
+
+```bash
+docker compose --profile cli run --rm --no-deps cli update 12 \
+  --title "Revisar PR da issue #9" \
+  --priority medium \
+  --status in_progress \
+  --due-date 2026-11-22 \
+  --category estudos
+```
+
+A edição substitui **todos** os campos da tarefa, como o `PUT` da Web. Informe novamente cada campo obrigatório; uma descrição omitida fica vazia. O `<id>` é o mesmo exibido na tabela Web e na saída do `create`.
+
+### Campos e validação
+
+As opções `--title`, `--description`, `--priority`, `--status`, `--due-date` e `--category` correspondem aos campos da tabela da **Issue #2**. A API aplica exatamente as mesmas regras da Web. Quando algum campo é inválido, a CLI lista cada erro e termina com código 1:
+
+```text
+Validation failed:
+  due_date: Informe uma data de entrega válida (AAAA-MM-DD).
+  priority: Escolha a prioridade: baixa, média ou alta.
+```
+
+| Situação | Mensagem | Código de saída |
+|---|---|---|
+| Opção desconhecida, argumento extra ou `update` sem id | ajuda de uso | 2 |
+| `TODO_TOKEN` ausente | `Set TODO_TOKEN.` | 2 |
+| Campos inválidos (HTTP 422) | `Validation failed:` e um erro por campo | 1 |
+| Tarefa inexistente no `update` (HTTP 404) | `Task <id> not found.` | 1 |
+| Token inválido ou expirado (HTTP 401) | `API returned HTTP 401.` | 1 |
+
+### Endpoints
+
+| Método e rota | Função | Respostas |
+|---|---|---|
+| `POST /api/cli/records` | Cadastra uma tarefa | 201 com a tarefa criada; 400; 401; 422 |
+| `PUT /api/cli/records/{id}` | Edita uma tarefa | 200 com a tarefa atualizada; 400; 401; 404; 422 |
+
+Os dois exigem `Authorization: Bearer <token>`. O cookie de sessão da Web não é aceito nesses endpoints, e o token da CLI não é aceito nos endpoints Web. As consultas SQL de cadastro e edição da CLI são próprias, separadas das usadas pela Web, mas gravam na mesma tabela `tasks`. Por isso as tarefas criadas ou editadas pela CLI aparecem imediatamente na tabela Web, depois de recarregar a página ou atualizar a listagem.
+
+### Logs e testes
+
+Cada comando gera um evento `layer: "api"` com `client: "cli"` (`operation` igual a `create` ou `update`) e, ao chegar ao banco, um evento `layer: "db"` com `client: "cli"` (`insert` ou `update`) e o mesmo `request_id`. O token não é registrado.
+
+```bash
+docker compose logs -f app | grep '"client":"cli"' | grep -E '"operation":"(create|update|insert)"'
+```
+
+Os testes e a cobertura usam os comandos da issue #7. Os testes unitários cobrem as opções e os códigos de saída da CLI, o corpo e os cabeçalhos enviados, as respostas 201/200/401/404/422, a rejeição do cookie Web nos endpoints CLI e as consultas SQL da CLI. O teste de integração executa a CLI real contra a API do Compose, cadastra e edita uma tarefa e confirma pela API Web que ela foi persistida e aparece na Web.
