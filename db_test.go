@@ -335,3 +335,66 @@ func TestDatabaseWebTaskDelete(t *testing.T) {
 		})
 	}
 }
+
+func TestDatabaseWebTaskSearch(t *testing.T) {
+	for _, tc := range []struct {
+		name, order, fail string
+		total             int
+	}{
+		{name: "combined filters", order: "asc", total: 6},
+		{name: "descending", order: "desc", total: 6},
+		{name: "empty", order: "asc"},
+		{name: "count fails", order: "asc", fail: "count"},
+		{name: "query fails", order: "asc", fail: "query"},
+		{name: "scan fails", order: "asc", fail: "scan"},
+		{name: "iteration fails", order: "asc", fail: "rows"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			where := `WHERE ($1 = '' OR strpos(lower(title), lower($1)) > 0) AND ($2 = '' OR priority = $2) AND ($3 = '' OR status = $3)`
+			count := mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM tasks "+where)).WithArgs("%_'", "high", "pending")
+			if tc.fail == "count" {
+				count.WillReturnError(errors.New("count failure"))
+			} else {
+				count.WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(tc.total))
+				direction := strings.ToUpper(tc.order)
+				selectQuery := mock.ExpectQuery(regexp.QuoteMeta("FROM tasks "+where+" ORDER BY lower(title) "+direction+", id "+direction+" LIMIT $4 OFFSET $5")).WithArgs("%_'", "high", "pending", 5, 5)
+				switch tc.fail {
+				case "query":
+					selectQuery.WillReturnError(errors.New("query failure"))
+				case "scan":
+					selectQuery.WillReturnRows(sqlmock.NewRows([]string{"id", "title", "description", "priority", "status", "due_date", "category"}).AddRow("bad", "x", "", "high", "pending", "2026-11-20", "work"))
+				case "rows":
+					selectQuery.WillReturnRows(taskRows(sampleTask).RowError(0, errors.New("iteration failure")))
+				default:
+					rows := sqlmock.NewRows([]string{"id", "title", "description", "priority", "status", "due_date", "category"})
+					if tc.total > 0 {
+						rows.AddRow(int64(7), sampleTask.Title, sampleTask.Description, sampleTask.Priority, sampleTask.Status, sampleTask.DueDate, sampleTask.Category)
+					}
+					selectQuery.WillReturnRows(rows)
+				}
+			}
+			var logs bytes.Buffer
+			query := taskSearchQuery{taskPageQuery: taskPageQuery{Page: 2, Sort: "title", Order: tc.order}, Title: "%_'", Priority: "high", Status: "pending"}
+			page, err := (&database{conn: conn, logs: &logs}).searchWebTasks(context.Background(), query, "req-list")
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+			if tc.fail != "" {
+				if err == nil {
+					t.Fatal("expected search failure")
+				}
+				expectDBLog(t, logs.String(), "search", "error")
+				return
+			}
+			if err != nil || page.Items == nil || page.Page != 2 || page.Total != tc.total || page.TotalPages != (tc.total+4)/5 {
+				t.Fatalf("page = %+v, error %v", page, err)
+			}
+			expectDBLog(t, logs.String(), "search", "success")
+		})
+	}
+}

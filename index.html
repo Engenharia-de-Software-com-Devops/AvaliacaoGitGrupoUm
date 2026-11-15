@@ -113,6 +113,35 @@
       </form>
 
       <h2>Tarefas</h2>
+      <form id="search-form">
+        <fieldset>
+          <legend>Busca avançada</legend>
+          <label for="search-title">Título contém</label>
+          <input id="search-title" name="title" maxlength="100">
+          <div class="row">
+            <div>
+              <label for="search-priority">Prioridade</label>
+              <select id="search-priority" name="priority">
+                <option value="">Todas</option>
+                <option value="low">Baixa</option>
+                <option value="medium">Média</option>
+                <option value="high">Alta</option>
+              </select>
+            </div>
+            <div>
+              <label for="search-status">Situação</label>
+              <select id="search-status" name="status">
+                <option value="">Todas</option>
+                <option value="pending">Pendente</option>
+                <option value="in_progress">Em andamento</option>
+                <option value="done">Concluída</option>
+              </select>
+            </div>
+          </div>
+          <button type="submit">Buscar</button>
+          <button type="button" id="clear-search" class="secondary">Limpar filtros</button>
+        </fieldset>
+      </form>
       <p id="list-error" role="alert"></p>
       <p id="list-message" role="status"></p>
       <div class="table-wrap">
@@ -151,10 +180,11 @@
     const listMessage = document.getElementById('list-message');
     const priorityLabels = { low: 'Baixa', medium: 'Média', high: 'Alta' };
     const statusLabels = { pending: 'Pendente', in_progress: 'Em andamento', done: 'Concluída' };
-    // Listing state: current page, ordering and the ids selected on this page.
-    const listState = { page: 1, sort: 'id', order: 'asc', totalPages: 0 };
+    // Listing state includes the last submitted filters, page and ordering.
+    const listState = { page: 1, sort: 'id', order: 'asc', totalPages: 0, filters: null };
     const selected = new Set();
     let editingId = null;
+    let listRequest = 0;
 
     async function showSession() {
       const response = await fetch('/api/web/session');
@@ -259,7 +289,7 @@
       });
       if (!rows.length) {
         const tr = document.createElement('tr');
-        const td = cell('Nenhuma tarefa cadastrada.');
+        const td = cell(listState.filters ? 'Nenhuma tarefa encontrada para os filtros.' : 'Nenhuma tarefa cadastrada.');
         td.colSpan = 6;
         tr.append(td);
         rows.push(tr);
@@ -277,22 +307,29 @@
       }
       updateSelectionControls();
     }
-    // Loads the current page from the database through the web listing endpoint.
+    // Loads the current listing or filtered page, ignoring stale responses.
     async function loadList() {
       listError.textContent = '';
+      const requestId = ++listRequest;
       const params = new URLSearchParams({ page: listState.page, sort: listState.sort, order: listState.order });
+      if (listState.filters) {
+        for (const [key, value] of Object.entries(listState.filters)) if (value) params.set(key, value);
+      }
       try {
-        const response = await fetch(`/api/web/records?${params}`);
+        const endpoint = listState.filters ? '/api/web/records/search' : '/api/web/records';
+        const response = await fetch(`${endpoint}?${params}`);
+        if (requestId !== listRequest) return;
         if (response.status === 401) { listError.textContent = 'Sessão expirada. Recarregue a página e entre novamente.'; return; }
         if (!response.ok) { listError.textContent = 'Não foi possível carregar as tarefas.'; return; }
         const page = await response.json();
+        if (requestId !== listRequest) return;
         // After deletions the current page may no longer exist: go to the last one.
         if (!page.items.length && listState.page > 1 && page.total_pages > 0) {
           listState.page = page.total_pages;
           return loadList();
         }
         renderList(page);
-      } catch (_) { listError.textContent = 'Não foi possível conectar ao servidor.'; }
+      } catch (_) { if (requestId === listRequest) listError.textContent = 'Não foi possível conectar ao servidor.'; }
     }
     async function deleteSelected() {
       const ids = [...selected];
@@ -367,6 +404,25 @@
       } catch (_) { taskError.textContent = 'Não foi possível conectar ao servidor.'; }
     });
 
+    const searchForm = document.getElementById('search-form');
+    searchForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      listState.filters = {
+        title: document.getElementById('search-title').value.trim(),
+        priority: document.getElementById('search-priority').value,
+        status: document.getElementById('search-status').value
+      };
+      listState.page = 1;
+      listMessage.textContent = '';
+      loadList();
+    });
+    document.getElementById('clear-search').addEventListener('click', () => {
+      searchForm.reset();
+      listState.filters = null;
+      listState.page = 1;
+      listMessage.textContent = '';
+      loadList();
+    });
     for (const button of document.querySelectorAll('button.sort')) {
       button.addEventListener('click', () => {
         const column = button.dataset.sort;

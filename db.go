@@ -166,6 +166,14 @@ type taskPageQuery struct {
 	Order string
 }
 
+// taskSearchQuery combines web-specific search filters with paging and sorting.
+type taskSearchQuery struct {
+	taskPageQuery
+	Title    string
+	Priority string
+	Status   string
+}
+
 // taskPage is one page of tasks plus the totals needed for pagination.
 type taskPage struct {
 	Items      []task `json:"items"`
@@ -188,6 +196,38 @@ func (d *database) listWebTasks(ctx context.Context, query taskPageQuery, reques
 	}
 	rows, err := d.conn.QueryContext(ctx, `SELECT `+webTaskColumns+` FROM tasks ORDER BY `+webTaskSortColumns[query.Sort]+` `+direction+`, id `+direction+` LIMIT $1 OFFSET $2`,
 		webPageSize, (query.Page-1)*webPageSize)
+	if err != nil {
+		return taskPage{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item task
+		if err = rows.Scan(&item.ID, &item.Title, &item.Description, &item.Priority, &item.Status, &item.DueDate, &item.Category); err != nil {
+			return taskPage{}, err
+		}
+		page.Items = append(page.Items, item)
+	}
+	if err = rows.Err(); err != nil {
+		return taskPage{}, err
+	}
+	return page, nil
+}
+
+// searchWebTasks uses its own parameterized web query for both count and page.
+func (d *database) searchWebTasks(ctx context.Context, query taskSearchQuery, requestID string) (page taskPage, err error) {
+	defer func() { d.logOutcome("search", requestID, "Web task search completed", err) }()
+	page = taskPage{Items: []task{}, Page: query.Page, PageSize: webPageSize}
+	const where = `WHERE ($1 = '' OR strpos(lower(title), lower($1)) > 0) AND ($2 = '' OR priority = $2) AND ($3 = '' OR status = $3)`
+	if err = d.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks `+where, query.Title, query.Priority, query.Status).Scan(&page.Total); err != nil {
+		return taskPage{}, err
+	}
+	page.TotalPages = (page.Total + webPageSize - 1) / webPageSize
+	direction := "ASC"
+	if query.Order == "desc" {
+		direction = "DESC"
+	}
+	rows, err := d.conn.QueryContext(ctx, `SELECT `+webTaskColumns+` FROM tasks `+where+` ORDER BY `+webTaskSortColumns[query.Sort]+` `+direction+`, id `+direction+` LIMIT $4 OFFSET $5`,
+		query.Title, query.Priority, query.Status, webPageSize, (query.Page-1)*webPageSize)
 	if err != nil {
 		return taskPage{}, err
 	}

@@ -39,6 +39,7 @@ type taskStore interface {
 	updateWebTask(context.Context, int64, task, string) (task, error)
 	getWebTask(context.Context, int64, string) (task, error)
 	listWebTasks(context.Context, taskPageQuery, string) (taskPage, error)
+	searchWebTasks(context.Context, taskSearchQuery, string) (taskPage, error)
 	deleteWebTask(context.Context, int64, string) error
 }
 
@@ -76,6 +77,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPut && webRecordID(r.URL.Path) > 0:
 		operation = "update"
 		status = s.saveTask(w, r, id, webRecordID(r.URL.Path))
+	case r.Method == http.MethodGet && r.URL.Path == "/api/web/records/search":
+		operation = "search"
+		status = s.searchTasks(w, r, id)
 	case r.Method == http.MethodGet && webRecordID(r.URL.Path) > 0:
 		operation = "get"
 		status = s.getTask(w, r, id, webRecordID(r.URL.Path))
@@ -266,6 +270,23 @@ func (s *server) listTasks(w http.ResponseWriter, r *http.Request, requestID str
 		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
 	}
 	return writeJSON(w, http.StatusOK, page)
+}
+
+func (s *server) searchTasks(w http.ResponseWriter, r *http.Request, requestID string) int {
+	if _, ok := s.currentUser(r); !ok {
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+	}
+	values := r.URL.Query()
+	page, ok := parseTaskPageQuery(values)
+	query := taskSearchQuery{taskPageQuery: page, Title: strings.TrimSpace(values.Get("title")), Priority: strings.TrimSpace(values.Get("priority")), Status: strings.TrimSpace(values.Get("status"))}
+	if !ok || utf8.RuneCountInString(query.Title) > 100 || (query.Priority != "" && !taskPriorities[query.Priority]) || (query.Status != "" && !taskStatuses[query.Status]) {
+		return writeError(w, http.StatusBadRequest, "Invalid search parameters")
+	}
+	result, err := s.tasks.searchWebTasks(r.Context(), query, requestID)
+	if err != nil {
+		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
+	}
+	return writeJSON(w, http.StatusOK, result)
 }
 
 func (s *server) deleteTask(w http.ResponseWriter, r *http.Request, requestID string, id int64) int {
