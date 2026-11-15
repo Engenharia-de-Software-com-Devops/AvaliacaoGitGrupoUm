@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -256,6 +257,46 @@ func TestIntegration(t *testing.T) {
 	if none := search(url.Values{"title": {prefix}, "priority": {"low"}, "status": {"pending"}}); none.Total != 0 || len(none.Items) != 0 {
 		t.Fatalf("nonmatching search = %+v", none)
 	}
+	exportCSV := func(values url.Values) [][]string {
+		status, body := call(http.MethodGet, "/api/web/records/export?"+values.Encode(), "", true)
+		records, err := csv.NewReader(bytes.NewReader(body)).ReadAll()
+		if status != http.StatusOK || err != nil || len(records) < 1 || strings.Join(records[0], ",") != "id,title,description,priority,status,due_date,category" {
+			t.Fatalf("export %v status = %d, err %v, body %s", values, status, err, body)
+		}
+		return records[1:]
+	}
+	if status, _ := call(http.MethodGet, "/api/web/records/export", "", false); status != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated export status = %d", status)
+	}
+	if status, _ := call(http.MethodGet, "/api/web/records/export?priority=urgent", "", true); status != http.StatusBadRequest {
+		t.Fatalf("invalid export status = %d", status)
+	}
+	// Six filtered tasks exceed one page of five: the export must contain all of them.
+	exported := exportCSV(url.Values{"title": {prefix}, "priority": {"high"}, "status": {"pending"}, "sort": {"title"}, "order": {"desc"}, "page": {"1"}})
+	if len(exported) != 6 {
+		t.Fatalf("filtered export rows = %d, want 6", len(exported))
+	}
+	for i, record := range exported {
+		if !strings.HasPrefix(record[1], prefix) || record[3] != "high" || record[4] != "pending" {
+			t.Fatalf("unrelated exported row = %v", record)
+		}
+		if i > 0 && strings.ToLower(exported[i-1][1]) < strings.ToLower(record[1]) {
+			t.Fatalf("export not in descending title order: %v", exported)
+		}
+	}
+	if rows := exportCSV(url.Values{"title": {prefix + " %_"}}); len(rows) != 1 || rows[0][1] != prefix+" %_literal" {
+		t.Fatalf("literal export = %v", rows)
+	}
+	if rows := exportCSV(url.Values{"title": {prefix}, "priority": {"low"}}); len(rows) != 0 {
+		t.Fatalf("nonmatching export = %v", rows)
+	}
+	var total int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM tasks`).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if rows := exportCSV(url.Values{}); len(rows) != total {
+		t.Fatalf("unfiltered export rows = %d, want every task (%d)", len(rows), total)
+	}
 	if status, _ := call(http.MethodDelete, recordPath, "", true); status != http.StatusNoContent {
 		t.Fatalf("delete status = %d", status)
 	}
@@ -271,5 +312,5 @@ func TestIntegration(t *testing.T) {
 			t.Fatalf("cleanup delete %d status = %d", id, status)
 		}
 	}
-	fmt.Println("health, login, authenticated session, rejection, password hash, task create/edit persistence, paginated sorted listing and deletion verified")
+	fmt.Println("health, login, authenticated session, rejection, password hash, task create/edit persistence, paginated sorted listing, CSV export and deletion verified")
 }
