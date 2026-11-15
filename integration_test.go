@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -261,6 +262,7 @@ func TestIntegration(t *testing.T) {
 		t.Fatalf("nonmatching search = %+v", none)
 	}
 	testCLISearchIntegration(t, base, cliToken, cookie, prefix)
+	testCLIExportIntegration(t, base, cliToken, cookie, prefix)
 	exportCSV := func(values url.Values) [][]string {
 		status, body := call(http.MethodGet, "/api/web/records/export?"+values.Encode(), "", true)
 		records, err := csv.NewReader(bytes.NewReader(body)).ReadAll()
@@ -640,5 +642,83 @@ func testCLIListAndDeleteIntegration(t *testing.T, base, token string, id int64,
 	}
 	if _, stderr, err := cli(token, "delete", fmt.Sprint(id)); err == nil || !strings.Contains(stderr, "not found") {
 		t.Fatalf("CLI delete of a missing task: %v, %s", err, stderr)
+	}
+}
+
+// testCLIExportIntegration checks that the CLI export endpoint and command
+// return every filtered task, ignoring paging, with exactly the same CSV as
+// the web export for the same filters, both on the standard output and in a
+// file written with --output.
+func testCLIExportIntegration(t *testing.T, base, token string, cookie *http.Cookie, prefix string) {
+	t.Helper()
+	download := func(path string, values url.Values, bearer string, web bool) (int, string) {
+		req, err := http.NewRequest(http.MethodGet, base+path+"?"+values.Encode(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		if web {
+			req.AddCookie(cookie)
+		}
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response.StatusCode, string(body)
+	}
+	for _, bearer := range []string{"", "invalid"} {
+		if status, _ := download("/api/cli/records/export", url.Values{}, bearer, false); status != http.StatusUnauthorized {
+			t.Fatalf("CLI export with token %q: %d", bearer, status)
+		}
+	}
+	if status, _ := download("/api/cli/records/export", url.Values{"status": {"unknown"}}, token, false); status != http.StatusBadRequest {
+		t.Fatalf("invalid CLI export status: %d", status)
+	}
+	filters := url.Values{"title": {prefix}, "priority": {"high"}, "status": {"pending"}, "sort": {"due_date"}, "order": {"desc"}}
+	webStatus, webCSV := download("/api/web/records/export", filters, "", true)
+	paged := url.Values{"page": {"2"}, "page_size": {"5"}}
+	for key, value := range filters {
+		paged[key] = value
+	}
+	cliStatus, cliCSV := download("/api/cli/records/export", paged, token, false)
+	records, err := csv.NewReader(strings.NewReader(cliCSV)).ReadAll()
+	if webStatus != http.StatusOK || cliStatus != http.StatusOK || err != nil || len(records) != 7 {
+		t.Fatalf("CLI export rows = %d (%v), web %d, CLI %d", len(records), err, webStatus, cliStatus)
+	}
+	if cliCSV != webCSV {
+		t.Fatalf("CLI and web exports differ:\nCLI %q\nweb %q", cliCSV, webCSV)
+	}
+	cli := func(args ...string) (string, string, error) {
+		cmd := exec.Command("go", append([]string{"run", "./cli"}, args...)...)
+		cmd.Env = append(os.Environ(), "TODO_API_URL="+base, "TODO_TOKEN="+token)
+		var out, errs bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &errs
+		err := cmd.Run()
+		return out.String(), errs.String(), err
+	}
+	args := []string{"export", "--title", prefix, "--priority", "high", "--status", "pending", "--sort", "due_date", "--order", "desc"}
+	if out, errs, err := cli(args...); err != nil || out != webCSV {
+		t.Fatalf("CLI export to stdout: %v %s\n%q", err, errs, out)
+	}
+	file := filepath.Join(t.TempDir(), "tarefas.csv")
+	if out, errs, err := cli(append(args, "--output", file)...); err != nil || !strings.Contains(out, "CSV saved to "+file) {
+		t.Fatalf("CLI export to file: %v %s %s", err, out, errs)
+	}
+	if content, err := os.ReadFile(file); err != nil || string(content) != webCSV {
+		t.Fatalf("exported file differs from the web export: %v\n%q", err, content)
+	}
+	_, webAll := download("/api/web/records/export", url.Values{}, "", true)
+	if out, errs, err := cli("export"); err != nil || out != webAll {
+		t.Fatalf("unfiltered CLI export differs from the web export: %v %s", err, errs)
+	}
+	if _, errs, err := cli("export", "--priority", "urgent"); err == nil || !strings.Contains(errs, "Invalid export options") {
+		t.Fatalf("invalid CLI export options: %v %s", err, errs)
 	}
 }
