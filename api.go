@@ -38,6 +38,8 @@ type taskStore interface {
 	createWebTask(context.Context, task, string) (task, error)
 	updateWebTask(context.Context, int64, task, string) (task, error)
 	getWebTask(context.Context, int64, string) (task, error)
+	listWebTasks(context.Context, taskPageQuery, string) (taskPage, error)
+	deleteWebTask(context.Context, int64, string) error
 }
 
 type server struct {
@@ -77,6 +79,12 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && webRecordID(r.URL.Path) > 0:
 		operation = "get"
 		status = s.getTask(w, r, id, webRecordID(r.URL.Path))
+	case r.Method == http.MethodGet && r.URL.Path == "/api/web/records":
+		operation = "list"
+		status = s.listTasks(w, r, id)
+	case r.Method == http.MethodDelete && webRecordID(r.URL.Path) > 0:
+		operation = "delete"
+		status = s.deleteTask(w, r, id, webRecordID(r.URL.Path))
 	case r.Method == http.MethodGet && r.URL.Path == "/":
 		operation, status = "home", http.StatusOK
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -213,6 +221,66 @@ func (s *server) getTask(w http.ResponseWriter, r *http.Request, requestID strin
 	}
 	found, err := s.tasks.getWebTask(r.Context(), id, requestID)
 	return respondTask(w, http.StatusOK, found, err)
+}
+
+// maxWebPage bounds the requested page so the SQL offset cannot overflow.
+const maxWebPage = 100000
+
+// parseTaskPageQuery reads page, sort and order from the query string, applying
+// the defaults (first page, ordered by id ascending). It reports false for any
+// value outside the accepted set.
+func parseTaskPageQuery(values url.Values) (taskPageQuery, bool) {
+	query := taskPageQuery{Page: 1, Sort: "id", Order: "asc"}
+	if value := values.Get("page"); value != "" {
+		page, err := strconv.Atoi(value)
+		if err != nil || page < 1 || page > maxWebPage {
+			return query, false
+		}
+		query.Page = page
+	}
+	if value := values.Get("sort"); value != "" {
+		if _, ok := webTaskSortColumns[value]; !ok {
+			return query, false
+		}
+		query.Sort = value
+	}
+	if value := values.Get("order"); value != "" {
+		if value != "asc" && value != "desc" {
+			return query, false
+		}
+		query.Order = value
+	}
+	return query, true
+}
+
+func (s *server) listTasks(w http.ResponseWriter, r *http.Request, requestID string) int {
+	if _, ok := s.currentUser(r); !ok {
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+	}
+	query, ok := parseTaskPageQuery(r.URL.Query())
+	if !ok {
+		return writeError(w, http.StatusBadRequest, "Invalid listing parameters")
+	}
+	page, err := s.tasks.listWebTasks(r.Context(), query, requestID)
+	if err != nil {
+		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
+	}
+	return writeJSON(w, http.StatusOK, page)
+}
+
+func (s *server) deleteTask(w http.ResponseWriter, r *http.Request, requestID string, id int64) int {
+	if _, ok := s.currentUser(r); !ok {
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+	}
+	err := s.tasks.deleteWebTask(r.Context(), id, requestID)
+	if errors.Is(err, errTaskNotFound) {
+		return writeError(w, http.StatusNotFound, "Task not found")
+	}
+	if err != nil {
+		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return http.StatusNoContent
 }
 
 func respondTask(w http.ResponseWriter, status int, result task, err error) int {

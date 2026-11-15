@@ -236,6 +236,7 @@ func TestValidateTask(t *testing.T) {
 
 type fakeTasks struct {
 	saved     task
+	query     taskPageQuery
 	id        int64
 	err       error
 	requestID string
@@ -265,6 +266,23 @@ func (f *fakeTasks) updateWebTask(_ context.Context, id int64, input task, reque
 
 func (f *fakeTasks) getWebTask(_ context.Context, id int64, requestID string) (task, error) {
 	return f.record(id, sampleTask, requestID)
+}
+
+func (f *fakeTasks) listWebTasks(_ context.Context, query taskPageQuery, requestID string) (taskPage, error) {
+	f.calls++
+	f.query, f.requestID = query, requestID
+	if f.err != nil {
+		return taskPage{}, f.err
+	}
+	stored := sampleTask
+	stored.ID = 7
+	return taskPage{Items: []task{stored}, Page: query.Page, PageSize: webPageSize, Total: 6, TotalPages: 2}, nil
+}
+
+func (f *fakeTasks) deleteWebTask(_ context.Context, id int64, requestID string) error {
+	f.calls++
+	f.id, f.requestID = id, requestID
+	return f.err
 }
 
 func taskServer(store *fakeTasks) (*server, *bytes.Buffer) {
@@ -354,6 +372,91 @@ func TestWebTaskEndpointFailures(t *testing.T) {
 				if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || len(body.Errors) != 5 {
 					t.Fatalf("validation body = %s", response.Body.String())
 				}
+			}
+			if !strings.Contains(logs.String(), `"layer":"api","client":"web"`) || !strings.Contains(logs.String(), `"status":"error"`) {
+				t.Fatalf("failure not logged: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestWebTaskList(t *testing.T) {
+	for _, tc := range []struct {
+		name, query string
+		want        taskPageQuery
+	}{
+		{name: "defaults", query: "", want: taskPageQuery{Page: 1, Sort: "id", Order: "asc"}},
+		{name: "page and sort", query: "?page=2&sort=due_date&order=desc", want: taskPageQuery{Page: 2, Sort: "due_date", Order: "desc"}},
+		{name: "title", query: "?sort=title", want: taskPageQuery{Page: 1, Sort: "title", Order: "asc"}},
+		{name: "priority", query: "?sort=priority&order=asc", want: taskPageQuery{Page: 1, Sort: "priority", Order: "asc"}},
+		{name: "status", query: "?sort=status", want: taskPageQuery{Page: 1, Sort: "status", Order: "asc"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{}
+			server, logs := taskServer(store)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, taskRequest(http.MethodGet, "/api/web/records"+tc.query, "", true))
+			if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("status = %d, body %s", response.Code, response.Body.String())
+			}
+			if store.query != tc.want {
+				t.Fatalf("query = %+v, want %+v", store.query, tc.want)
+			}
+			var page taskPage
+			if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil || len(page.Items) != 1 || page.Items[0].ID != 7 || page.PageSize != 5 || page.TotalPages != 2 {
+				t.Fatalf("page = %+v, %v", page, err)
+			}
+			want := `"layer":"api","client":"web","operation":"list","status":"success","request_id":"` + store.requestID + `"`
+			if store.requestID == "" || !strings.Contains(logs.String(), want) {
+				t.Fatalf("API log not correlated: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestWebTaskDelete(t *testing.T) {
+	store := &fakeTasks{}
+	server, logs := taskServer(store)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, taskRequest(http.MethodDelete, "/api/web/records/7", "", true))
+	if response.Code != http.StatusNoContent || response.Body.Len() != 0 || store.id != 7 {
+		t.Fatalf("status = %d, id = %d, body %s", response.Code, store.id, response.Body.String())
+	}
+	want := `"layer":"api","client":"web","operation":"delete","status":"success","request_id":"` + store.requestID + `"`
+	if store.requestID == "" || !strings.Contains(logs.String(), want) {
+		t.Fatalf("API log not correlated: %s", logs.String())
+	}
+}
+
+func TestWebTaskListAndDeleteFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path string
+		authenticated      bool
+		storeErr           error
+		want               int
+	}{
+		{name: "list without session", method: http.MethodGet, path: "/api/web/records", want: http.StatusUnauthorized},
+		{name: "delete without session", method: http.MethodDelete, path: "/api/web/records/7", want: http.StatusUnauthorized},
+		{name: "page zero", method: http.MethodGet, path: "/api/web/records?page=0", authenticated: true, want: http.StatusBadRequest},
+		{name: "page not numeric", method: http.MethodGet, path: "/api/web/records?page=abc", authenticated: true, want: http.StatusBadRequest},
+		{name: "page too large", method: http.MethodGet, path: "/api/web/records?page=100001", authenticated: true, want: http.StatusBadRequest},
+		{name: "unknown sort", method: http.MethodGet, path: "/api/web/records?sort=description", authenticated: true, want: http.StatusBadRequest},
+		{name: "unknown order", method: http.MethodGet, path: "/api/web/records?order=up", authenticated: true, want: http.StatusBadRequest},
+		{name: "list storage failure", method: http.MethodGet, path: "/api/web/records", authenticated: true, storeErr: errors.New("database down"), want: http.StatusInternalServerError},
+		{name: "delete missing task", method: http.MethodDelete, path: "/api/web/records/7", authenticated: true, storeErr: errTaskNotFound, want: http.StatusNotFound},
+		{name: "delete storage failure", method: http.MethodDelete, path: "/api/web/records/7", authenticated: true, storeErr: errors.New("database down"), want: http.StatusInternalServerError},
+		{name: "delete invalid id", method: http.MethodDelete, path: "/api/web/records/abc", authenticated: true, want: http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{err: tc.storeErr}
+			server, logs := taskServer(store)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, taskRequest(tc.method, tc.path, "", tc.authenticated))
+			if response.Code != tc.want {
+				t.Fatalf("status = %d, want %d (%s)", response.Code, tc.want, response.Body.String())
+			}
+			if (tc.storeErr == nil) != (store.calls == 0) {
+				t.Fatalf("store calls = %d", store.calls)
 			}
 			if !strings.Contains(logs.String(), `"layer":"api","client":"web"`) || !strings.Contains(logs.String(), `"status":"error"`) {
 				t.Fatalf("failure not logged: %s", logs.String())
