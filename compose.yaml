@@ -1,0 +1,51 @@
+services:
+  app:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      DB_HOST: db:5432
+      DB_USER: todo_app
+      DB_NAME: todo
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      INITIAL_USERNAME: ${INITIAL_USERNAME:-}
+      INITIAL_PASSWORD: ${INITIAL_PASSWORD:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    depends_on:
+      db:
+        condition: service_healthy
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: todo_app
+      POSTGRES_DB: todo
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  tests:
+    build: .
+    profiles: ["test"]
+    command: ["go", "test", "./..."]
+  integration:
+    build: .
+    profiles: ["test"]
+    environment:
+      API_BASE_URL: http://app:8080
+      DB_HOST: db:5432
+      DB_USER: todo_app
+      DB_NAME: todo
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      INITIAL_USERNAME: ${INITIAL_USERNAME:-}
+      INITIAL_PASSWORD: ${INITIAL_PASSWORD:-}
+    depends_on:
+      app:
+        condition: service_started
+    command: ["go", "test", "-run", "^TestIntegration$$", "-v", "."]
+
+volumes:
+  postgres_data:

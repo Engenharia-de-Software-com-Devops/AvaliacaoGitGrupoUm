@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ToDo List</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 4rem auto; padding: 0 1rem; }
+    label, input, button { display: block; width: 100%; box-sizing: border-box; }
+    input, button { margin: .5rem 0 1rem; padding: .7rem; }
+    #error { color: #a00; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>ToDo List</h1>
+    <form id="login">
+      <label for="username">Usuário</label>
+      <input id="username" name="username" autocomplete="username" required>
+      <label for="password">Senha</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit">Entrar</button>
+      <p id="error" role="alert"></p>
+    </form>
+    <p id="welcome" hidden></p>
+  </main>
+  <script>
+    const form = document.getElementById('login');
+    const error = document.getElementById('error');
+    const welcome = document.getElementById('welcome');
+    async function showSession() {
+      const response = await fetch('/api/web/session');
+      if (!response.ok) return;
+      const user = await response.json();
+      welcome.textContent = `Bem-vindo, ${user.username}!`;
+      welcome.hidden = false;
+      form.hidden = true;
+    }
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      error.textContent = '';
+      try {
+        const response = await fetch('/api/web/login', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: document.getElementById('username').value, password: document.getElementById('password').value })
+        });
+        document.getElementById('password').value = '';
+        if (!response.ok) { error.textContent = 'Não foi possível entrar. Verifique suas credenciais.'; return; }
+        await showSession();
+      } catch (_) { error.textContent = 'Não foi possível conectar ao servidor.'; }
+    });
+    showSession().catch(() => { error.textContent = 'Não foi possível conectar ao servidor.'; });
+  </script>
+</body>
+</html>
