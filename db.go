@@ -55,6 +55,20 @@ func (d *database) bootstrap(ctx context.Context, username, password, requestID 
 		return err
 	}
 	_, err = d.conn.ExecContext(ctx, `INSERT INTO users (username, password_hash) VALUES ($1, $2) ON CONFLICT (username) DO NOTHING`, username, string(hash))
+	if err != nil {
+		return err
+	}
+	_, err = d.conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS tasks (
+		id BIGSERIAL PRIMARY KEY,
+		title TEXT NOT NULL,
+		description TEXT NOT NULL DEFAULT '',
+		priority TEXT NOT NULL CHECK (priority IN ('low', 'medium', 'high')),
+		status TEXT NOT NULL CHECK (status IN ('pending', 'in_progress', 'done')),
+		due_date DATE NOT NULL,
+		category TEXT NOT NULL,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`)
 	return err
 }
 
