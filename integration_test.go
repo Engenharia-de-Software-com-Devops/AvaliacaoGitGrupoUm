@@ -276,12 +276,29 @@ func TestIntegration(t *testing.T) {
 	if len(exported) != 6 {
 		t.Fatalf("filtered export rows = %d, want 6", len(exported))
 	}
+	// The expected order comes from PostgreSQL itself: its collation (en_US.utf8
+	// in the Compose image) ignores punctuation such as "%_", so a byte-wise Go
+	// comparison would disagree with the database for the same ORDER BY.
+	orderedRows, err := db.Query(`SELECT id FROM tasks WHERE strpos(title, $1) > 0 AND priority = 'high' AND status = 'pending'
+		ORDER BY lower(title) DESC, id DESC`, prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expectedOrder []string
+	for orderedRows.Next() {
+		var id int64
+		if err := orderedRows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		expectedOrder = append(expectedOrder, fmt.Sprint(id))
+	}
+	orderedRows.Close()
 	for i, record := range exported {
 		if !strings.HasPrefix(record[1], prefix) || record[3] != "high" || record[4] != "pending" {
 			t.Fatalf("unrelated exported row = %v", record)
 		}
-		if i > 0 && strings.ToLower(exported[i-1][1]) < strings.ToLower(record[1]) {
-			t.Fatalf("export not in descending title order: %v", exported)
+		if i >= len(expectedOrder) || record[0] != expectedOrder[i] {
+			t.Fatalf("export not in descending title order: %v, want ids %v", exported, expectedOrder)
 		}
 	}
 	if rows := exportCSV(url.Values{"title": {prefix + " %_"}}); len(rows) != 1 || rows[0][1] != prefix+" %_literal" {
