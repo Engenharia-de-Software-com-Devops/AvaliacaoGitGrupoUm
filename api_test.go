@@ -338,6 +338,7 @@ type fakeTasks struct {
 	search    taskSearchQuery
 	export    taskExportQuery
 	cliQuery  cliPageQuery
+	cliSearch cliSearchQuery
 	exported  []task
 	id        int64
 	err       error
@@ -905,6 +906,82 @@ func (f *fakeTasks) listCLITasks(_ context.Context, query cliPageQuery, requestI
 	stored := sampleTask
 	stored.ID = 7
 	return taskPage{Items: []task{stored}, Page: query.Page, PageSize: query.PageSize, Total: 12, TotalPages: 2}, nil
+}
+
+func (f *fakeTasks) searchCLITasks(_ context.Context, query cliSearchQuery, requestID string) (taskPage, error) {
+	f.calls++
+	f.cliSearch, f.requestID = query, requestID
+	if f.err != nil {
+		return taskPage{}, f.err
+	}
+	return taskPage{Items: []task{sampleTask}, Page: query.Page, PageSize: query.PageSize, Total: 1, TotalPages: 1}, nil
+}
+
+func TestCLITaskSearch(t *testing.T) {
+	for _, tc := range []struct {
+		name, query string
+		want        cliSearchQuery
+	}{
+		{name: "defaults", want: cliSearchQuery{cliPageQuery: cliPageQuery{Page: 1, PageSize: 10, Sort: "id", Order: "asc"}}},
+		{name: "combined", query: "?title=+Git+&priority=high&status=pending&page=2&page_size=5&sort=title&order=desc", want: cliSearchQuery{cliPageQuery: cliPageQuery{Page: 2, PageSize: 5, Sort: "title", Order: "desc"}, Title: "Git", Priority: "high", Status: "pending"}},
+		{name: "literal", query: "?title=%25_%27&priority=low&status=in_progress", want: cliSearchQuery{cliPageQuery: cliPageQuery{Page: 1, PageSize: 10, Sort: "id", Order: "asc"}, Title: "%_'", Priority: "low", Status: "in_progress"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{}
+			server, logs := cliTaskServer(store)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, cliTaskRequest(http.MethodGet, "/api/cli/records/search"+tc.query, "", "cli-valid"))
+			if response.Code != http.StatusOK || store.cliSearch != tc.want {
+				t.Fatalf("status = %d, query = %+v", response.Code, store.cliSearch)
+			}
+			var page taskPage
+			if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil || len(page.Items) != 1 || page.PageSize != tc.want.PageSize {
+				t.Fatalf("response = %s", response.Body.String())
+			}
+			want := `"layer":"api","client":"cli","operation":"search","status":"success","request_id":"` + store.requestID + `"`
+			if store.requestID == "" || !strings.Contains(logs.String(), want) || strings.Contains(logs.String(), "cli-valid") {
+				t.Fatalf("invalid API log: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestCLITaskSearchFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, query, token string
+		cookie             bool
+		storeErr           error
+		want               int
+	}{
+		{name: "missing token", want: http.StatusUnauthorized},
+		{name: "invalid token", token: "invalid", want: http.StatusUnauthorized},
+		{name: "expired token", token: "cli-expired", want: http.StatusUnauthorized},
+		{name: "web cookie", cookie: true, want: http.StatusUnauthorized},
+		{name: "invalid page", token: "cli-valid", query: "?page=0", want: http.StatusBadRequest},
+		{name: "invalid size", token: "cli-valid", query: "?page_size=101", want: http.StatusBadRequest},
+		{name: "invalid sort", token: "cli-valid", query: "?sort=bad", want: http.StatusBadRequest},
+		{name: "invalid priority", token: "cli-valid", query: "?priority=urgent", want: http.StatusBadRequest},
+		{name: "invalid status", token: "cli-valid", query: "?status=unknown", want: http.StatusBadRequest},
+		{name: "title too long", token: "cli-valid", query: "?title=" + strings.Repeat("a", 101), want: http.StatusBadRequest},
+		{name: "storage error", token: "cli-valid", storeErr: errors.New("database down"), want: http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{err: tc.storeErr}
+			server, logs := cliTaskServer(store)
+			request := cliTaskRequest(http.MethodGet, "/api/cli/records/search"+tc.query, "", tc.token)
+			if tc.cookie {
+				request.AddCookie(&http.Cookie{Name: "session", Value: "valid"})
+			}
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, request)
+			if response.Code != tc.want || (store.calls > 0) != (tc.storeErr != nil) {
+				t.Fatalf("status = %d, calls = %d", response.Code, store.calls)
+			}
+			if !strings.Contains(logs.String(), `"client":"cli","operation":"search","status":"error"`) {
+				t.Fatalf("invalid failure log: %s", logs.String())
+			}
+		})
+	}
 }
 
 func (f *fakeTasks) deleteCLITask(_ context.Context, id int64, requestID string) error {
