@@ -528,3 +528,44 @@ func (d *database) deleteCLITask(ctx context.Context, id int64, requestID string
 	}
 	return nil
 }
+
+// cliExportQuery carries the CLI search filters and ordering of a CSV export.
+// It has no page or page size: the export always contains every matching task.
+type cliExportQuery struct {
+	Title    string
+	Priority string
+	Status   string
+	Sort     string
+	Order    string
+}
+
+// exportCLITasks uses its own CLI query to return every task matching the
+// filters, in the requested order and without LIMIT/OFFSET.
+func (d *database) exportCLITasks(ctx context.Context, query cliExportQuery, requestID string) (items []task, err error) {
+	defer func() { d.logCLIOutcome("export", requestID, "CLI task export loaded", err) }()
+	direction := "ASC"
+	if query.Order == "desc" {
+		direction = "DESC"
+	}
+	rows, err := d.conn.QueryContext(ctx, `SELECT cli_task.id, cli_task.title, cli_task.description, cli_task.priority, cli_task.status,
+		to_char(cli_task.due_date, 'YYYY-MM-DD'), cli_task.category FROM tasks AS cli_task
+		WHERE ($1 = '' OR strpos(lower(cli_task.title), lower($1)) > 0) AND ($2 = '' OR cli_task.priority = $2) AND ($3 = '' OR cli_task.status = $3)
+		ORDER BY `+cliTaskSortColumns[query.Sort]+` `+direction+`, cli_task.id `+direction,
+		query.Title, query.Priority, query.Status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items = []task{}
+	for rows.Next() {
+		var item task
+		if err = rows.Scan(&item.ID, &item.Title, &item.Description, &item.Priority, &item.Status, &item.DueDate, &item.Category); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

@@ -852,3 +852,62 @@ func TestDatabaseCLITaskDelete(t *testing.T) {
 		})
 	}
 }
+
+func TestDatabaseCLITaskExport(t *testing.T) {
+	where := `WHERE ($1 = '' OR strpos(lower(cli_task.title), lower($1)) > 0) AND ($2 = '' OR cli_task.priority = $2) AND ($3 = '' OR cli_task.status = $3)`
+	for _, tc := range []struct {
+		name, order, fail string
+		rows              int
+	}{
+		{name: "more than one page", order: "asc", rows: 12},
+		{name: "descending", order: "desc", rows: 1},
+		{name: "empty", order: "asc"},
+		{name: "query fails", order: "asc", fail: "query"},
+		{name: "scan fails", order: "asc", fail: "scan"},
+		{name: "iteration fails", order: "asc", fail: "rows"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			direction := strings.ToUpper(tc.order)
+			// The CLI export query has no LIMIT/OFFSET: every filtered row is returned.
+			expected := mock.ExpectQuery(regexp.QuoteMeta("FROM tasks AS cli_task "+where+" ORDER BY cli_task.due_date "+direction+", cli_task.id "+direction) + "$").WithArgs("report", "", "pending")
+			switch tc.fail {
+			case "query":
+				expected.WillReturnError(errors.New("query failure"))
+			case "scan":
+				expected.WillReturnRows(sqlmock.NewRows([]string{"id", "title", "description", "priority", "status", "due_date", "category"}).AddRow("bad", "x", "", "high", "pending", "2026-11-20", "work"))
+			case "rows":
+				expected.WillReturnRows(taskRows(sampleTask).RowError(0, errors.New("iteration failure")))
+			default:
+				rows := sqlmock.NewRows([]string{"id", "title", "description", "priority", "status", "due_date", "category"})
+				for i := 1; i <= tc.rows; i++ {
+					rows.AddRow(int64(i), sampleTask.Title, sampleTask.Description, sampleTask.Priority, sampleTask.Status, sampleTask.DueDate, sampleTask.Category)
+				}
+				expected.WillReturnRows(rows)
+			}
+			var logs bytes.Buffer
+			query := cliExportQuery{Title: "report", Status: "pending", Sort: "due_date", Order: tc.order}
+			items, err := (&database{conn: conn, logs: &logs}).exportCLITasks(context.Background(), query, "req-cli")
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+			status := "success"
+			if tc.fail != "" {
+				status = "error"
+				if err == nil || items != nil {
+					t.Fatalf("expected export failure, got %v, %v", items, err)
+				}
+			} else if err != nil || items == nil || len(items) != tc.rows {
+				t.Fatalf("items = %+v, error %v", items, err)
+			}
+			want := `"layer":"db","client":"cli","operation":"export","status":"` + status + `","request_id":"req-cli"`
+			if !strings.Contains(logs.String(), want) {
+				t.Fatalf("unexpected db log: %s", logs.String())
+			}
+		})
+	}
+}
