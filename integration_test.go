@@ -434,4 +434,76 @@ func testCLIIntegration(t *testing.T, base, username, password string) {
 	if response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("missing CLI token status = %d", response.StatusCode)
 	}
+	testCLITaskIntegration(t, base, username, password, strings.TrimSpace(string(token)))
+}
+
+// testCLITaskIntegration creates and edits a task through the CLI binary and
+// checks through the web API that the persisted task is visible on the web.
+func testCLITaskIntegration(t *testing.T, base, username, password, token string) {
+	t.Helper()
+	cli := func(token string, args ...string) (string, string, error) {
+		cmd := exec.Command("go", append([]string{"run", "./cli"}, args...)...)
+		cmd.Env = append(os.Environ(), "TODO_API_URL="+base, "TODO_TOKEN="+token)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		return stdout.String(), stderr.String(), err
+	}
+	fields := []string{"--title", "CLI integration task", "--description", "Created by the CLI", "--priority", "medium", "--due-date", "2026-12-24", "--category", "cli"}
+	if _, _, err := cli("", append([]string{"create"}, fields...)...); err == nil {
+		t.Fatal("CLI create without token succeeded")
+	}
+	if _, stderr, err := cli(token, "create", "--title", "x", "--priority", "urgent"); err == nil || !strings.Contains(stderr, "Validation failed:") || !strings.Contains(stderr, "due_date:") {
+		t.Fatalf("invalid CLI create: %v, %s", err, stderr)
+	}
+	stdout, stderr, err := cli(token, append([]string{"create"}, fields...)...)
+	var id int64
+	if err != nil || !strings.HasPrefix(stdout, "Task ") {
+		t.Fatalf("CLI create failed: %v, %s", err, stderr)
+	}
+	if _, err := fmt.Sscanf(stdout, "Task %d created.", &id); err != nil || id < 1 {
+		t.Fatalf("CLI create output = %q", stdout)
+	}
+	edited := append([]string{"update", fmt.Sprint(id)}, fields...)
+	edited[3] = "CLI integration task edited"
+	edited = append(edited, "--status", "in_progress")
+	if stdout, stderr, err := cli(token, edited...); err != nil || !strings.Contains(stdout, "status: in_progress") {
+		t.Fatalf("CLI update failed: %v, %s", err, stderr)
+	}
+	if _, stderr, err := cli(token, append([]string{"update", "999999999"}, fields...)...); err == nil || !strings.Contains(stderr, "not found") {
+		t.Fatalf("CLI update of a missing task: %v, %s", err, stderr)
+	}
+	credentials, err := json.Marshal(map[string]string{"username": username, "password": password})
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := http.Post(base+"/api/web/login", "application/json", bytes.NewReader(credentials))
+	if err != nil || login.StatusCode != http.StatusOK || len(login.Cookies()) != 1 {
+		t.Fatalf("web login for CLI check failed: %v", err)
+	}
+	login.Body.Close()
+	webCall := func(method string) (int, string) {
+		request, err := http.NewRequest(method, fmt.Sprintf("%s/api/web/records/%d", base, id), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.AddCookie(login.Cookies()[0])
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response.StatusCode, string(body)
+	}
+	status, body := webCall(http.MethodGet)
+	if status != http.StatusOK || !strings.Contains(body, `"title":"CLI integration task edited"`) || !strings.Contains(body, `"status":"in_progress"`) || !strings.Contains(body, `"due_date":"2026-12-24"`) {
+		t.Fatalf("CLI task not visible on the web: %d %s", status, body)
+	}
+	if status, _ := webCall(http.MethodDelete); status != http.StatusNoContent {
+		t.Fatalf("cleanup of CLI task status = %d", status)
+	}
 }
