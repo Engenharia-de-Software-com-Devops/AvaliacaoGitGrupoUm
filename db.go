@@ -438,6 +438,47 @@ type cliPageQuery struct {
 	Order    string
 }
 
+// cliSearchQuery combines CLI paging with the three web-equivalent filters.
+type cliSearchQuery struct {
+	cliPageQuery
+	Title    string
+	Priority string
+	Status   string
+}
+
+// searchCLITasks uses CLI-specific parameterized queries for the count and page.
+func (d *database) searchCLITasks(ctx context.Context, query cliSearchQuery, requestID string) (page taskPage, err error) {
+	defer func() { d.logCLIOutcome("search", requestID, "CLI task search completed", err) }()
+	page = taskPage{Items: []task{}, Page: query.Page, PageSize: query.PageSize}
+	const where = `WHERE ($1 = '' OR strpos(lower(cli_task.title), lower($1)) > 0) AND ($2 = '' OR cli_task.priority = $2) AND ($3 = '' OR cli_task.status = $3)`
+	if err = d.conn.QueryRowContext(ctx, `SELECT COUNT(cli_task.id) FROM tasks AS cli_task `+where, query.Title, query.Priority, query.Status).Scan(&page.Total); err != nil {
+		return taskPage{}, err
+	}
+	page.TotalPages = (page.Total + query.PageSize - 1) / query.PageSize
+	direction := "ASC"
+	if query.Order == "desc" {
+		direction = "DESC"
+	}
+	rows, err := d.conn.QueryContext(ctx, `SELECT cli_task.id, cli_task.title, cli_task.description, cli_task.priority, cli_task.status,
+		to_char(cli_task.due_date, 'YYYY-MM-DD'), cli_task.category FROM tasks AS cli_task `+where+` ORDER BY `+cliTaskSortColumns[query.Sort]+` `+direction+`, cli_task.id `+direction+` LIMIT $4 OFFSET $5`,
+		query.Title, query.Priority, query.Status, query.PageSize, (query.Page-1)*query.PageSize)
+	if err != nil {
+		return taskPage{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item task
+		if err = rows.Scan(&item.ID, &item.Title, &item.Description, &item.Priority, &item.Status, &item.DueDate, &item.Category); err != nil {
+			return taskPage{}, err
+		}
+		page.Items = append(page.Items, item)
+	}
+	if err = rows.Err(); err != nil {
+		return taskPage{}, err
+	}
+	return page, nil
+}
+
 // listCLITasks loads one page of tasks for the CLI with its own count and select queries.
 func (d *database) listCLITasks(ctx context.Context, query cliPageQuery, requestID string) (page taskPage, err error) {
 	defer func() { d.logCLIOutcome("select", requestID, "CLI task page loaded", err) }()

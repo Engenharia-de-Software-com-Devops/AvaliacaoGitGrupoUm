@@ -739,6 +739,69 @@ func TestDatabaseCLITaskListEmpty(t *testing.T) {
 	}
 }
 
+func TestDatabaseCLITaskSearch(t *testing.T) {
+	for _, tc := range []struct {
+		name, order, fail string
+		total             int
+	}{
+		{name: "combined filters", order: "asc", total: 6},
+		{name: "descending", order: "desc", total: 6},
+		{name: "empty", order: "asc"},
+		{name: "count fails", order: "asc", fail: "count"},
+		{name: "select fails", order: "asc", fail: "select"},
+		{name: "scan fails", order: "asc", fail: "scan"},
+		{name: "iteration fails", order: "asc", fail: "rows"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			where := `WHERE ($1 = '' OR strpos(lower(cli_task.title), lower($1)) > 0) AND ($2 = '' OR cli_task.priority = $2) AND ($3 = '' OR cli_task.status = $3)`
+			count := mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(cli_task.id) FROM tasks AS cli_task "+where)).WithArgs("%_'", "high", "pending")
+			if tc.fail == "count" {
+				count.WillReturnError(errors.New("count failure"))
+			} else {
+				count.WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(tc.total))
+				direction := strings.ToUpper(tc.order)
+				query := mock.ExpectQuery(regexp.QuoteMeta("FROM tasks AS cli_task "+where+" ORDER BY lower(cli_task.title) "+direction+", cli_task.id "+direction+" LIMIT $4 OFFSET $5")).WithArgs("%_'", "high", "pending", 5, 5)
+				switch tc.fail {
+				case "select":
+					query.WillReturnError(errors.New("select failure"))
+				case "scan":
+					query.WillReturnRows(sqlmock.NewRows([]string{"id", "title", "description", "priority", "status", "due_date", "category"}).AddRow("bad", "x", "", "high", "pending", "2026-11-20", "work"))
+				case "rows":
+					query.WillReturnRows(taskRows(sampleTask).RowError(0, errors.New("iteration failure")))
+				default:
+					rows := sqlmock.NewRows([]string{"id", "title", "description", "priority", "status", "due_date", "category"})
+					if tc.total > 0 {
+						rows.AddRow(int64(7), sampleTask.Title, sampleTask.Description, sampleTask.Priority, sampleTask.Status, sampleTask.DueDate, sampleTask.Category)
+					}
+					query.WillReturnRows(rows)
+				}
+			}
+			var logs bytes.Buffer
+			query := cliSearchQuery{cliPageQuery: cliPageQuery{Page: 2, PageSize: 5, Sort: "title", Order: tc.order}, Title: "%_'", Priority: "high", Status: "pending"}
+			page, err := (&database{conn: conn, logs: &logs}).searchCLITasks(context.Background(), query, "req-cli")
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+			if tc.fail != "" {
+				if err == nil {
+					t.Fatal("expected search failure")
+				}
+				expectCLIDBLog(t, logs.String(), "search", "error")
+				return
+			}
+			if err != nil || page.Items == nil || page.Page != 2 || page.PageSize != 5 || page.Total != tc.total || page.TotalPages != (tc.total+4)/5 {
+				t.Fatalf("page = %+v, error %v", page, err)
+			}
+			expectCLIDBLog(t, logs.String(), "search", "success")
+		})
+	}
+}
+
 func TestDatabaseCLITaskDelete(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
