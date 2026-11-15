@@ -15,6 +15,7 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode/utf8"
 )
 
 const usage = `Usage: cli <command> [options]
@@ -30,6 +31,7 @@ Commands:
   search [options]       Search tasks using combinable filters (requires TODO_TOKEN)
   delete <id>            Delete a task by id (requires TODO_TOKEN)
   export [options]       Export every filtered task as CSV (requires TODO_TOKEN)
+  dashboard              Show the web dashboard indicators as text (requires TODO_TOKEN)
 
 List and search options:
   --page N               Page number, starting at 1 (default 1)
@@ -88,6 +90,9 @@ func run(args []string, getenv func(string) string, client *http.Client, stdout,
 	}
 	if args[0] == "export" {
 		return runExport(args[1:], base, getenv("TODO_TOKEN"), client, stdout, stderr)
+	}
+	if args[0] == "dashboard" {
+		return runDashboard(args[1:], base, getenv("TODO_TOKEN"), client, stdout, stderr)
 	}
 	if len(args) != 1 || (args[0] != "health" && args[0] != "token" && args[0] != "session") {
 		_, _ = io.WriteString(stderr, usage)
@@ -411,6 +416,72 @@ func runExport(args []string, base, token string, client *http.Client, stdout, s
 		return 1
 	}
 	_, _ = fmt.Fprintf(stdout, "CSV saved to %s.\n", *output)
+	return 0
+}
+
+// indicator is one line of a dashboard section: a field value and its task count.
+type indicator struct {
+	Key   string `json:"key"`
+	Count int    `json:"count"`
+}
+
+// runDashboard prints, as text, the same three indicators shown by the web
+// dashboard: tasks by status, by priority and by category, with each count and
+// its percentage of the total.
+func runDashboard(args []string, base, token string, client *http.Client, stdout, stderr io.Writer) int {
+	if len(args) != 0 {
+		_, _ = io.WriteString(stderr, usage)
+		return 2
+	}
+	if token == "" {
+		_, _ = io.WriteString(stderr, "Set TODO_TOKEN.\n")
+		return 2
+	}
+	response, code := sendAuthorized(client, http.MethodGet, base+"/api/cli/dashboard", token, stderr)
+	if code != 0 {
+		return code
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		_, _ = fmt.Fprintf(stderr, "API returned HTTP %d.\n", response.StatusCode)
+		return 1
+	}
+	var result struct {
+		Total      int         `json:"total"`
+		ByStatus   []indicator `json:"by_status"`
+		ByPriority []indicator `json:"by_priority"`
+		ByCategory []indicator `json:"by_category"`
+	}
+	if json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&result) != nil {
+		_, _ = io.WriteString(stderr, "Invalid API response.\n")
+		return 1
+	}
+	sections := []struct {
+		title string
+		items []indicator
+	}{{"Tasks by status", result.ByStatus}, {"Tasks by priority", result.ByPriority}, {"Tasks by category", result.ByCategory}}
+	width := 0
+	for _, section := range sections {
+		for _, item := range section.items {
+			width = max(width, utf8.RuneCountInString(item.Key))
+		}
+	}
+	_, _ = fmt.Fprintf(stdout, "Total: %d tasks\n", result.Total)
+	for _, section := range sections {
+		_, _ = fmt.Fprintf(stdout, "\n%s\n", section.title)
+		if len(section.items) == 0 {
+			_, _ = io.WriteString(stdout, "  (none)\n")
+		}
+		for _, item := range section.items {
+			// Rounded half up, like Math.round in the web dashboard.
+			percent := 0
+			if result.Total > 0 {
+				percent = (item.Count*200 + result.Total) / (2 * result.Total)
+			}
+			padding := strings.Repeat(" ", width-utf8.RuneCountInString(item.Key))
+			_, _ = fmt.Fprintf(stdout, "  %s%s  %5d  %4s\n", item.Key, padding, item.Count, strconv.Itoa(percent)+"%")
+		}
+	}
 	return 0
 }
 
