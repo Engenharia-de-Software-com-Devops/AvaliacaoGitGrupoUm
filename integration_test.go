@@ -107,5 +107,58 @@ func TestIntegration(t *testing.T) {
 	if strings.Contains(hash, password) || bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
 		t.Fatal("password hash invalid")
 	}
-	fmt.Println("health, login, authenticated session, rejection and password hash verified")
+	cookie := login.Cookies()[0]
+	call := func(method, path, body string, authenticated bool) (int, []byte) {
+		request, err := http.NewRequest(method, base+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		if authenticated {
+			request.AddCookie(cookie)
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		content, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response.StatusCode, content
+	}
+	newTask := `{"title":"Integration task","description":"Created by the integration test","priority":"high","status":"pending","due_date":"2026-11-20","category":"tests"}`
+	if status, _ := call(http.MethodPost, "/api/web/records", newTask, false); status != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated create status = %d", status)
+	}
+	if status, body := call(http.MethodPost, "/api/web/records", `{"title":"x"}`, true); status != http.StatusUnprocessableEntity || !strings.Contains(string(body), "due_date") {
+		t.Fatalf("invalid create status = %d, body %s", status, body)
+	}
+	status, body := call(http.MethodPost, "/api/web/records", newTask, true)
+	var created struct {
+		ID int64 `json:"id"`
+	}
+	if status != http.StatusCreated || json.Unmarshal(body, &created) != nil || created.ID < 1 {
+		t.Fatalf("create status = %d, body %s", status, body)
+	}
+	recordPath := fmt.Sprintf("/api/web/records/%d", created.ID)
+	edited := strings.Replace(strings.Replace(newTask, `"pending"`, `"done"`, 1), "Integration task", "Integration task edited", 1)
+	if status, body := call(http.MethodPut, recordPath, edited, true); status != http.StatusOK || !strings.Contains(string(body), `"status":"done"`) {
+		t.Fatalf("update status = %d, body %s", status, body)
+	}
+	if status, body := call(http.MethodGet, recordPath, "", true); status != http.StatusOK || !strings.Contains(string(body), "Integration task edited") {
+		t.Fatalf("get status = %d, body %s", status, body)
+	}
+	if status, _ := call(http.MethodPut, "/api/web/records/999999999", edited, true); status != http.StatusNotFound {
+		t.Fatalf("missing update status = %d", status)
+	}
+	var title, taskStatus, dueDate string
+	if err := db.QueryRow(`SELECT title, status, to_char(due_date, 'YYYY-MM-DD') FROM tasks WHERE id = $1`, created.ID).Scan(&title, &taskStatus, &dueDate); err != nil {
+		t.Fatal(err)
+	}
+	if title != "Integration task edited" || taskStatus != "done" || dueDate != "2026-11-20" {
+		t.Fatalf("persisted task = %q %q %q", title, taskStatus, dueDate)
+	}
+	fmt.Println("health, login, authenticated session, rejection, password hash and task create/edit persistence verified")
 }
