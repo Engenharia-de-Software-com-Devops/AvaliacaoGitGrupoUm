@@ -236,3 +236,41 @@ docker compose logs -f app | grep '"operation":"export"'
 ```
 
 Os testes e a cobertura usam os comandos da issue #1. Os testes unitários verificam o cabeçalho, o escape de vírgulas, aspas e quebras de linha, os filtros repassados ao banco, a ausência de paginação na consulta e as respostas 400, 401 e 500. O teste de integração exporta, com o PostgreSQL real, seis tarefas filtradas (mais de uma página), confere a ordenação, os caracteres literais e um filtro sem resultados, e verifica que a exportação sem filtros contém todas as tarefas da tabela.
+
+## Issue #6 — Dashboard (Web)
+
+### Usar pela Web
+
+1. Inicie a aplicação com `docker compose up --build` e entre em <http://localhost:8080>.
+2. Após o login, role até a seção **Dashboard**, abaixo da tabela de tarefas. Os três gráficos são carregados do banco pela API.
+3. Os valores são atualizados ao **recarregar a página** e também logo depois de cadastrar, editar ou excluir uma tarefa.
+
+### Indicadores
+
+| Indicador | Gráfico | O que mostra |
+|---|---|---|
+| **Tarefas por situação** | Rosca | Quantidade e percentual de tarefas `pending` (Pendente), `in_progress` (Em andamento) e `done` (Concluída). O número no centro é o total de tarefas. |
+| **Tarefas por prioridade** | Colunas | Quantidade de tarefas `low` (Baixa), `medium` (Média) e `high` (Alta). |
+| **Tarefas por categoria** | Barras horizontais | Quantidade de tarefas em cada categoria cadastrada, da mais numerosa para a menos numerosa (empate em ordem alfabética). |
+
+Situação e prioridade sempre exibem as três opções, inclusive as que têm zero tarefas. As categorias são agrupadas exatamente como foram digitadas. Sem tarefas, o dashboard mostra zeros e a mensagem "Nenhuma categoria cadastrada.". Os indicadores consideram todas as tarefas, independentemente da busca ativa na tabela. Os mesmos três indicadores serão exibidos em texto pela CLI na issue #12.
+
+### Endpoint
+
+`GET /api/web/dashboard` exige a sessão obtida em `POST /api/web/login` e retorna **HTTP 401** sem sessão válida. Responde 200 com os indicadores calculados no PostgreSQL (`GROUP BY`), com consultas próprias da Web:
+
+```json
+{"total":15,"by_status":[{"key":"pending","count":10},{"key":"in_progress","count":2},{"key":"done","count":3}],"by_priority":[{"key":"low","count":2},{"key":"medium","count":3},{"key":"high","count":10}],"by_category":[{"key":"tests","count":7},{"key":"estudos","count":3},{"key":"trabalho","count":3},{"key":"casa","count":2}]}
+```
+
+### Logs e testes
+
+Cada carregamento gera `operation: "dashboard"` na API e no banco, com o mesmo `request_id`; sem sessão, só o log da API com `status: "error"`.
+
+```bash
+docker compose logs -f app | grep '"operation":"dashboard"'
+```
+
+Os testes unitários cobrem as três consultas, a soma do total, o dashboard vazio, as falhas do banco e as respostas 200/401/500. O teste de integração confere o 401, cria uma tarefa e verifica que o total aumenta ao recarregar, compara cada indicador da API com uma contagem feita diretamente no PostgreSQL e confirma que o total volta ao valor anterior após excluir a tarefa.
+
+O teste de integração da exportação CSV (#5) passou a obter a ordem esperada do próprio PostgreSQL: a collation `en_US.utf8` da imagem ignora pontuação como `%_` ao ordenar, e a comparação byte a byte do Go discordava do banco, fazendo `docker compose --profile test run --build --rm integration` falhar.
