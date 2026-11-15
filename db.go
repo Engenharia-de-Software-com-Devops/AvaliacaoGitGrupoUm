@@ -300,3 +300,67 @@ func (d *database) exportWebTasks(ctx context.Context, query taskExportQuery, re
 	}
 	return items, nil
 }
+
+// countItem is one bar or slice of a dashboard chart: a field value and how
+// many tasks have it.
+type countItem struct {
+	Key   string `json:"key"`
+	Count int    `json:"count"`
+}
+
+// dashboard holds the three web indicators: tasks by status, by priority and
+// by category, plus the total number of tasks.
+type dashboard struct {
+	Total      int         `json:"total"`
+	ByStatus   []countItem `json:"by_status"`
+	ByPriority []countItem `json:"by_priority"`
+	ByCategory []countItem `json:"by_category"`
+}
+
+// Status and priority list every allowed value in its logical order, including
+// the ones without tasks, so the charts always show the same bars.
+const (
+	webDashboardStatusQuery = `SELECT s.key, COUNT(t.id)
+		FROM (VALUES (1, 'pending'), (2, 'in_progress'), (3, 'done')) AS s(rank, key) LEFT JOIN tasks t ON t.status = s.key
+		GROUP BY s.rank, s.key ORDER BY s.rank`
+	webDashboardPriorityQuery = `SELECT p.key, COUNT(t.id)
+		FROM (VALUES (1, 'low'), (2, 'medium'), (3, 'high')) AS p(rank, key) LEFT JOIN tasks t ON t.priority = p.key
+		GROUP BY p.rank, p.key ORDER BY p.rank`
+	webDashboardCategoryQuery = `SELECT category, COUNT(*) FROM tasks GROUP BY category ORDER BY COUNT(*) DESC, category`
+)
+
+// countBy runs one aggregation query returning (key, count) rows.
+func (d *database) countBy(ctx context.Context, query string) ([]countItem, error) {
+	rows, err := d.conn.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []countItem{}
+	for rows.Next() {
+		var item countItem
+		if err := rows.Scan(&item.Key, &item.Count); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// webDashboard aggregates the web indicators in the database with its own queries.
+func (d *database) webDashboard(ctx context.Context, requestID string) (result dashboard, err error) {
+	defer func() { d.logOutcome("dashboard", requestID, "Web dashboard indicators loaded", err) }()
+	if result.ByStatus, err = d.countBy(ctx, webDashboardStatusQuery); err != nil {
+		return dashboard{}, err
+	}
+	if result.ByPriority, err = d.countBy(ctx, webDashboardPriorityQuery); err != nil {
+		return dashboard{}, err
+	}
+	if result.ByCategory, err = d.countBy(ctx, webDashboardCategoryQuery); err != nil {
+		return dashboard{}, err
+	}
+	for _, item := range result.ByStatus {
+		result.Total += item.Count
+	}
+	return result, nil
+}
