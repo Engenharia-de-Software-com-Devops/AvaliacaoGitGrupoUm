@@ -36,6 +36,9 @@ services:
       TODO_USERNAME: ${TODO_USERNAME:-}
       TODO_PASSWORD: ${TODO_PASSWORD:-}
       TODO_TOKEN: ${TODO_TOKEN:-}
+    volumes:
+      # CSV files written with "export --output exports/<file>" appear in ./exports on the host.
+      - ./exports:/app/exports
     depends_on:
       app:
         condition: service_started
