@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -57,6 +58,7 @@ func TestIntegration(t *testing.T) {
 		t.Fatalf("unauthorized status = %d", unauthorized.StatusCode)
 	}
 	username, password := os.Getenv("INITIAL_USERNAME"), os.Getenv("INITIAL_PASSWORD")
+	testCLIIntegration(t, base, username, password)
 	body, err := json.Marshal(map[string]string{"username": username, "password": password})
 	if err != nil {
 		t.Fatal(err)
@@ -399,4 +401,37 @@ func TestIntegration(t *testing.T) {
 		t.Fatal("dashboard total did not return after deleting the task")
 	}
 	fmt.Println("health, login, authenticated session, rejection, password hash, task create/edit persistence, paginated sorted listing, CSV export, deletion and dashboard indicators verified")
+}
+
+func testCLIIntegration(t *testing.T, base, username, password string) {
+	t.Helper()
+	command := func(action, token, pass string) ([]byte, error) {
+		cmd := exec.Command("go", "run", "./cli", action)
+		cmd.Env = append(os.Environ(), "TODO_API_URL="+base, "TODO_USERNAME="+username, "TODO_PASSWORD="+pass, "TODO_TOKEN="+token)
+		return cmd.Output()
+	}
+	if output, err := command("health", "", ""); err != nil || strings.TrimSpace(string(output)) != "OK" {
+		t.Fatalf("CLI health failed: %v", err)
+	}
+	token, err := command("token", "", password)
+	if err != nil || strings.TrimSpace(string(token)) == "" {
+		t.Fatalf("CLI token failed: %v", err)
+	}
+	if output, err := command("session", strings.TrimSpace(string(token)), ""); err != nil || strings.TrimSpace(string(output)) != username {
+		t.Fatalf("CLI authenticated session failed: %v", err)
+	}
+	if _, err := command("session", "invalid", ""); err == nil {
+		t.Fatal("invalid CLI token accepted")
+	}
+	if _, err := command("token", "", password+"-wrong"); err == nil {
+		t.Fatal("invalid CLI credentials accepted")
+	}
+	response, err := http.Get(base + "/api/cli/session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("missing CLI token status = %d", response.StatusCode)
+	}
 }

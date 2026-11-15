@@ -62,7 +62,7 @@ docker compose --profile test run --build --rm tests
 docker compose --profile test run --build --rm tests sh tools/coverage.sh
 ```
 
-O segundo comando executa os testes do verificador, gera o perfil de cobertura do Go e calcula separadamente as **linhas físicas executáveis** de `api.go` e `db.go` a partir dos intervalos instrumentados. Uma linha é considerada coberta se pelo menos um trecho executável nela foi executado; linhas vazias, comentários e linhas apenas com delimitadores são excluídas. O comando falha se faltar cobertura ou dados para qualquer arquivo. A porcentagem de *statements* do Go é exibida à parte e não é tratada como equivalente à cobertura de linhas.
+O segundo comando executa os testes do verificador, gera o perfil de cobertura do Go e calcula separadamente as **linhas físicas executáveis** de `api.go`, `db.go` e `cli/main.go` a partir dos intervalos instrumentados. Uma linha é considerada coberta se pelo menos um trecho executável nela foi executado; linhas vazias, comentários e linhas apenas com delimitadores são excluídas. O comando falha se faltar cobertura ou dados para qualquer arquivo. A porcentagem de *statements* do Go é exibida à parte e não é tratada como equivalente à cobertura de linhas.
 
 Para verificar a integração real com o PostgreSQL e a API, depois de exportar as credenciais acima:
 
@@ -70,7 +70,7 @@ Para verificar a integração real com o PostgreSQL e a API, depois de exportar 
 docker compose --profile test run --build --rm integration
 ```
 
-O teste usa o usuário configurado, verifica login válido e inválido, sessão, healthcheck e hash da senha no banco. A CLI e as funcionalidades de tarefas serão adicionadas nas próximas issues.
+O teste usa o usuário configurado e verifica login, sessão, healthchecks, hash da senha, funcionalidades Web e autenticação da CLI.
 
 ## Issue #2 — Cadastro e edição de tarefas (Web)
 
@@ -272,5 +272,48 @@ docker compose logs -f app | grep '"operation":"dashboard"'
 ```
 
 Os testes unitários cobrem as três consultas, a soma do total, o dashboard vazio, as falhas do banco e as respostas 200/401/500. O teste de integração confere o 401, cria uma tarefa e verifica que o total aumenta ao recarregar, compara cada indicador da API com uma contagem feita diretamente no PostgreSQL e confirma que o total volta ao valor anterior após excluir a tarefa.
+
+## Issue #7 — Estrutura CLI
+
+A CLI está em `cli/main.go`, usa somente a API e roda pelo serviço Compose `cli`. Antes dos comandos abaixo, configure as variáveis da seção **Issue #1** e inicie a aplicação com `docker compose up --build` em outro terminal. Neste terminal, as mesmas variáveis também precisam estar exportadas.
+
+### Ajuda e healthcheck
+
+```bash
+docker compose --profile cli run --rm --no-deps cli help
+docker compose --profile cli run --rm --no-deps cli health
+```
+
+O primeiro mostra os subcomandos disponíveis; o segundo consulta `GET /api/cli/health` e imprime `OK` quando a API responde HTTP 200.
+
+### Obter e usar um token
+
+O usuário e a senha são os mesmos configurados na inicialização. Leia a senha sem eco, para não colocá-la no histórico de comandos:
+
+```bash
+TODO_USERNAME="$INITIAL_USERNAME"
+read -r -s -p 'Senha da aplicação: ' TODO_PASSWORD
+printf '\n'
+export TODO_USERNAME TODO_PASSWORD
+TODO_TOKEN="$(docker compose --profile cli run --rm --no-deps -T cli token)"
+export TODO_TOKEN
+unset TODO_PASSWORD
+docker compose --profile cli run --rm --no-deps cli session
+```
+
+`token` envia as credenciais a `POST /api/cli/token` e retorna o token na saída padrão **para uso pelo operador**, não em logs. O comando `session` envia `Authorization: Bearer <token>` a `GET /api/cli/session` e imprime o usuário autenticado. Tokens ausentes ou inválidos são rejeitados com HTTP 401 pela API; a CLI também avisa quando a variável `TODO_TOKEN` está ausente. Tokens duram 12 horas e são invalidados ao reiniciar a aplicação.
+
+Não compartilhe a saída do comando `token`, a variável `TODO_TOKEN` ou a saída de `docker inspect`; variáveis de ambiente dos contêineres podem conter segredos. Após o uso, remova o token do ambiente com `unset TODO_TOKEN`. A comunicação HTTP sem TLS é apenas para o ambiente local do Compose.
+
+### Logs, testes e cobertura
+
+```bash
+docker compose logs -f app | grep '"client":"cli"'
+docker compose --profile test run --build --rm tests
+docker compose --profile test run --build --rm tests sh tools/coverage.sh
+docker compose --profile test run --build --rm integration
+```
+
+Os eventos JSON da API usam `client: "cli"`; quando a autenticação consulta o banco, a camada de dados também gera um evento com o mesmo `request_id`. Senhas e tokens não são registrados. Os testes cobrem CLI, API e banco; a verificação de linhas inclui os três arquivos de produção existentes.
 
 O teste de integração da exportação CSV (#5) passou a obter a ordem esperada do próprio PostgreSQL: a collation `en_US.utf8` da imagem ignora pontuação como `%_` ao ordenar, e a comparação byte a byte do Go discordava do banco, fazendo `docker compose --profile test run --build --rm integration` falhar.

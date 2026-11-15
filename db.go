@@ -17,6 +17,10 @@ type database struct {
 }
 
 func logEvent(w io.Writer, layer, operation, status, requestID, message string) {
+	logClientEvent(w, layer, "web", operation, status, requestID, message)
+}
+
+func logClientEvent(w io.Writer, layer, client, operation, status, requestID, message string) {
 	level := "INFO"
 	if status == "error" {
 		level = "ERROR"
@@ -30,7 +34,7 @@ func logEvent(w io.Writer, layer, operation, status, requestID, message string) 
 		Status    string `json:"status"`
 		RequestID string `json:"request_id"`
 		Message   string `json:"message"`
-	}{time.Now().UTC().Format(time.RFC3339Nano), level, layer, "web", operation, status, requestID, message}
+	}{time.Now().UTC().Format(time.RFC3339Nano), level, layer, client, operation, status, requestID, message}
 	line, _ := json.Marshal(event)
 	_, _ = w.Write(append(line, '\n'))
 }
@@ -79,6 +83,26 @@ func (d *database) authenticate(ctx context.Context, username, password, request
 			status = "error"
 		}
 		logEvent(d.logs, "db", "authenticate", status, requestID, "Authentication lookup completed")
+	}()
+	var hash string
+	err = d.conn.QueryRowContext(ctx, `SELECT password_hash FROM users WHERE username = $1`, username).Scan(&hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil, nil
+}
+
+// authenticateCLI reads the initial user's hash for CLI token issuance.
+func (d *database) authenticateCLI(ctx context.Context, username, password, requestID string) (ok bool, err error) {
+	defer func() {
+		status := "success"
+		if !ok || err != nil {
+			status = "error"
+		}
+		logClientEvent(d.logs, "db", "cli", "authenticate", status, requestID, "CLI authentication lookup completed")
 	}()
 	var hash string
 	err = d.conn.QueryRowContext(ctx, `SELECT password_hash FROM users WHERE username = $1`, username).Scan(&hash)
