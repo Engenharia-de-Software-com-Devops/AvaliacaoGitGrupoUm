@@ -54,6 +54,7 @@ type taskStore interface {
 	searchCLITasks(context.Context, cliSearchQuery, string) (taskPage, error)
 	exportCLITasks(context.Context, cliExportQuery, string) ([]task, error)
 	deleteCLITask(context.Context, int64, string) error
+	cliDashboard(context.Context, string) (dashboard, error)
 }
 
 type server struct {
@@ -102,6 +103,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/api/cli/records/export":
 		operation = "export"
 		status = s.exportCLIRecords(w, r, id)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/cli/dashboard":
+		operation = "dashboard"
+		status = s.cliDashboardIndicators(w, r, id)
 	case r.Method == http.MethodDelete && cliRecordID(r.URL.Path) > 0:
 		operation = "delete"
 		status = s.deleteCLIRecord(w, r, id, cliRecordID(r.URL.Path))
@@ -357,6 +361,19 @@ func parseCLIPageQuery(values url.Values) (cliPageQuery, bool) {
 		query.Order = value
 	}
 	return query, true
+}
+
+// cliDashboardIndicators answers the three dashboard indicators to a CLI
+// holding a valid Bearer token.
+func (s *server) cliDashboardIndicators(w http.ResponseWriter, r *http.Request, requestID string) int {
+	if _, ok := s.currentCLIUser(r); !ok {
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+	}
+	result, err := s.tasks.cliDashboard(r.Context(), requestID)
+	if err != nil {
+		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
+	}
+	return writeJSON(w, http.StatusOK, result)
 }
 
 // listCLIRecords answers one page of tasks to a CLI holding a valid Bearer token.
