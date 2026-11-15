@@ -98,6 +98,14 @@ Cada colega deve, individualmente:
 3. Antes de integrar a próxima PR principal, identifique o **commit do `main` resultante** deste merge. Crie nele uma tag única em `vMAJOR.MINOR.PATCH`, com versão maior que as anteriores, e publique uma release identificando a funcionalidade, a issue e a PR. Aponte a tag para o commit integrado, não para o branch da feature.
 4. Confirme que a issue foi fechada pelo vínculo da PR, registre a integração e avise a equipe. Repita para os demais autores do ciclo. O próximo ciclo só é liberado quando as três PRs principais atuais estiverem integradas.
 
+**Convenção de versionamento:**
+
+- As primeiras versões são `v0.1.0` para a issue #1 / PR #13 e `v0.2.0` para a issue #2 / PR #14. As releases foram publicadas retroativamente nos respectivos commits do `main`.
+- Enquanto o projeto estiver em desenvolvimento inicial (`0.y.z`), cada nova funcionalidade principal incrementa `MINOR` e reinicia `PATCH` em zero. Por exemplo, após `v0.2.0`, uma nova funcionalidade pode receber `v0.3.0`. Conforme SemVer, versões `0.y.z` ainda não garantem uma API estável.
+- `PATCH` é usado para correções compatíveis quando a equipe decidir publicar uma versão de correção. PRs corretivas não exigem tag ou release; versões extras devem ser justificadas no GitHub e no vídeo, conforme a avaliação.
+- A partir de `1.0.0`, incremente `MAJOR` para mudanças incompatíveis, `MINOR` para funcionalidades compatíveis e `PATCH` para correções compatíveis; ao incrementar `MAJOR` ou `MINOR`, reinicie os componentes inferiores em zero. A equipe decide quando declarar a API estável e lançar `1.0.0`.
+- Antes de publicar, confira as tags e releases existentes e o commit integrado; não reutilize uma tag nem a mova para outro commit. Se uma release estiver atrasada, registre a publicação retroativa e aponte para o commit correto, sem alterar o histórico.
+
 ## 5. Correções após o merge
 
 Quando um problema for descoberto após a integração:
