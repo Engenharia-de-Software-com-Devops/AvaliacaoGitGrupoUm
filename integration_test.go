@@ -329,5 +329,74 @@ func TestIntegration(t *testing.T) {
 			t.Fatalf("cleanup delete %d status = %d", id, status)
 		}
 	}
-	fmt.Println("health, login, authenticated session, rejection, password hash, task create/edit persistence, paginated sorted listing, CSV export and deletion verified")
+	if status, _ := call(http.MethodGet, "/api/web/dashboard", "", false); status != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated dashboard status = %d", status)
+	}
+	type indicator struct {
+		Key   string `json:"key"`
+		Count int    `json:"count"`
+	}
+	type indicators struct {
+		Total      int         `json:"total"`
+		ByStatus   []indicator `json:"by_status"`
+		ByPriority []indicator `json:"by_priority"`
+		ByCategory []indicator `json:"by_category"`
+	}
+	loadDashboard := func() indicators {
+		status, body := call(http.MethodGet, "/api/web/dashboard", "", true)
+		var result indicators
+		if status != http.StatusOK || json.Unmarshal(body, &result) != nil {
+			t.Fatalf("dashboard status = %d, body %s", status, body)
+		}
+		return result
+	}
+	// countIn reads the same indicator straight from PostgreSQL for comparison.
+	countIn := func(column, value string) int {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE `+column+` = $1`, value).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+	before := loadDashboard()
+	dashboardTask := strings.NewReplacer("Integration task", "Dashboard task", `"pending"`, `"in_progress"`, `"high"`, `"low"`, `"tests"`, `"dashboard-check"`).Replace(newTask)
+	status, body = call(http.MethodPost, "/api/web/records", dashboardTask, true)
+	var counted struct {
+		ID int64 `json:"id"`
+	}
+	if status != http.StatusCreated || json.Unmarshal(body, &counted) != nil {
+		t.Fatalf("create dashboard task status = %d, body %s", status, body)
+	}
+	after := loadDashboard()
+	var dbTotal int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM tasks`).Scan(&dbTotal); err != nil || after.Total != before.Total+1 || after.Total != dbTotal {
+		t.Fatalf("dashboard total = %d, before %d, database %d (%v)", after.Total, before.Total, dbTotal, err)
+	}
+	for _, item := range after.ByStatus {
+		if item.Count != countIn("status", item.Key) {
+			t.Fatalf("status %s = %d, database differs", item.Key, item.Count)
+		}
+	}
+	for _, item := range after.ByPriority {
+		if item.Count != countIn("priority", item.Key) {
+			t.Fatalf("priority %s = %d, database differs", item.Key, item.Count)
+		}
+	}
+	found := false
+	for _, item := range after.ByCategory {
+		if item.Count != countIn("category", item.Key) {
+			t.Fatalf("category %s = %d, database differs", item.Key, item.Count)
+		}
+		found = found || item.Key == "dashboard-check"
+	}
+	if len(after.ByStatus) != 3 || len(after.ByPriority) != 3 || !found {
+		t.Fatalf("dashboard indicators = %+v", after)
+	}
+	if status, _ := call(http.MethodDelete, fmt.Sprintf("/api/web/records/%d", counted.ID), "", true); status != http.StatusNoContent {
+		t.Fatalf("cleanup dashboard task status = %d", status)
+	}
+	if loadDashboard().Total != before.Total {
+		t.Fatal("dashboard total did not return after deleting the task")
+	}
+	fmt.Println("health, login, authenticated session, rejection, password hash, task create/edit persistence, paginated sorted listing, CSV export, deletion and dashboard indicators verified")
 }
