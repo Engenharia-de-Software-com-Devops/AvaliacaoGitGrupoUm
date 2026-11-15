@@ -198,3 +198,41 @@ docker compose logs -f app | grep '"operation":"search"'
 ```
 
 Os testes e a cobertura usam os comandos da issue #1. O teste de integração verifica combinações de filtros, paginação, caracteres literais, filtros inválidos e acesso sem sessão no PostgreSQL real.
+
+## Issue #5 — Exportação CSV (Web)
+
+### Usar pela Web
+
+Na seção **Tarefas**, clique em **Exportar CSV**. O navegador baixa o arquivo `tarefas.csv` com:
+
+- **todas as tarefas da busca ativa**, ou seja, dos últimos filtros enviados em **Buscar**, e não apenas as cinco linhas da página exibida;
+- **todas as tarefas cadastradas**, quando não há busca ativa (ao abrir a página ou depois de **Limpar filtros**).
+
+As linhas seguem a mesma ordenação da tabela. Filtros digitados mas ainda não enviados com **Buscar** não entram na exportação.
+
+### Formato do arquivo
+
+Arquivo CSV em UTF-8, separado por vírgulas, com uma linha de cabeçalho:
+
+```csv
+id,title,description,priority,status,due_date,category
+7,Write report,Quarterly numbers,high,pending,2026-11-20,work
+```
+
+Valores com vírgula, aspas ou quebra de linha ficam entre aspas, e as aspas internas são duplicadas (RFC 4180). `priority` e `status` usam os códigos da API (`low`/`medium`/`high` e `pending`/`in_progress`/`done`) e `due_date` usa o formato `AAAA-MM-DD`. Ao abrir no Excel com separador `;`, use **Dados → De Texto/CSV** e escolha vírgula como delimitador.
+
+### Endpoint
+
+`GET /api/web/records/export` exige a sessão obtida no login e retorna **401** sem sessão válida. Aceita os mesmos parâmetros opcionais da busca da issue #4 (`title`, `priority`, `status`, combinados com `AND`) e a ordenação da listagem (`sort`, `order`). O parâmetro `page` é ignorado, pois a exportação nunca é paginada. Valores inválidos retornam **400**.
+
+A resposta usa `Content-Type: text/csv; charset=utf-8` e `Content-Disposition: attachment; filename="tarefas.csv"`. O endpoint tem consulta SQL própria, parametrizada e sem `LIMIT`/`OFFSET`.
+
+### Logs e testes
+
+A exportação gera `operation: "export"` na API e no banco, correlacionados pelo mesmo `request_id`; requisições rejeitadas antes do acesso ao banco geram somente o log da API. O conteúdo das tarefas e os filtros não são registrados. Para acompanhar:
+
+```bash
+docker compose logs -f app | grep '"operation":"export"'
+```
+
+Os testes e a cobertura usam os comandos da issue #1. Os testes unitários verificam o cabeçalho, o escape de vírgulas, aspas e quebras de linha, os filtros repassados ao banco, a ausência de paginação na consulta e as respostas 400, 401 e 500. O teste de integração exporta, com o PostgreSQL real, seis tarefas filtradas (mais de uma página), confere a ordenação, os caracteres literais e um filtro sem resultados, e verifica que a exportação sem filtros contém todas as tarefas da tabela.
