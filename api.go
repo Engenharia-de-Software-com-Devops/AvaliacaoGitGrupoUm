@@ -169,22 +169,28 @@ func (s *server) issueCLIToken(w http.ResponseWriter, r *http.Request, requestID
 	return writeJSON(w, http.StatusOK, map[string]string{"token": token})
 }
 
-func (s *server) cliSession(w http.ResponseWriter, r *http.Request) int {
+// currentCLIUser returns the username of a valid, unexpired Bearer token.
+func (s *server) currentCLIUser(r *http.Request) (string, bool) {
 	token, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !found || token == "" {
-		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return "", false
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	user, ok := s.cliTokens[token]
 	if ok && time.Now().After(user.expires) {
 		delete(s.cliTokens, token)
 		ok = false
 	}
-	s.mu.Unlock()
+	return user.username, ok
+}
+
+func (s *server) cliSession(w http.ResponseWriter, r *http.Request) int {
+	username, ok := s.currentCLIUser(r)
 	if !ok {
 		return writeError(w, http.StatusUnauthorized, "Unauthorized")
 	}
-	return writeJSON(w, http.StatusOK, map[string]string{"username": user.username})
+	return writeJSON(w, http.StatusOK, map[string]string{"username": username})
 }
 
 func (s *server) login(w http.ResponseWriter, r *http.Request, id string) int {
@@ -266,9 +272,9 @@ func writeJSON(w http.ResponseWriter, status int, value any) int {
 	return status
 }
 
-// webRecordID extracts a positive task id from /api/web/records/{id}, or returns 0.
-func webRecordID(path string) int64 {
-	value, found := strings.CutPrefix(path, "/api/web/records/")
+// recordID extracts a positive task id from prefix+{id}, or returns 0.
+func recordID(prefix, path string) int64 {
+	value, found := strings.CutPrefix(path, prefix)
 	if !found {
 		return 0
 	}
@@ -279,20 +285,36 @@ func webRecordID(path string) int64 {
 	return id
 }
 
+// webRecordID extracts a positive task id from /api/web/records/{id}, or returns 0.
+func webRecordID(path string) int64 {
+	return recordID("/api/web/records/", path)
+}
+
+// decodeTask reads, normalizes and validates a task payload shared by the web
+// and CLI endpoints. When the payload is rejected it writes the 400 or 422
+// response and returns that status; otherwise the status is 0.
+func decodeTask(w http.ResponseWriter, r *http.Request) (task, int) {
+	var input task
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&input) != nil {
+		return task{}, writeError(w, http.StatusBadRequest, "Invalid request")
+	}
+	input = normalizeTask(input)
+	if problems := validateTask(input); len(problems) > 0 {
+		return task{}, writeJSON(w, http.StatusUnprocessableEntity, map[string]map[string]string{"errors": problems})
+	}
+	return input, 0
+}
+
 // saveTask creates a task when id is 0 and updates the given task otherwise.
 func (s *server) saveTask(w http.ResponseWriter, r *http.Request, requestID string, id int64) int {
 	if _, ok := s.currentUser(r); !ok {
 		return writeError(w, http.StatusUnauthorized, "Unauthorized")
 	}
-	var input task
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&input) != nil {
-		return writeError(w, http.StatusBadRequest, "Invalid request")
-	}
-	input = normalizeTask(input)
-	if problems := validateTask(input); len(problems) > 0 {
-		return writeJSON(w, http.StatusUnprocessableEntity, map[string]map[string]string{"errors": problems})
+	input, rejected := decodeTask(w, r)
+	if rejected != 0 {
+		return rejected
 	}
 	if id == 0 {
 		saved, err := s.tasks.createWebTask(r.Context(), input, requestID)
