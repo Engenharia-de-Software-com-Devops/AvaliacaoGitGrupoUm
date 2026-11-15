@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -28,6 +29,7 @@ Commands:
   list [options]         List tasks one page at a time (requires TODO_TOKEN)
   search [options]       Search tasks using combinable filters (requires TODO_TOKEN)
   delete <id>            Delete a task by id (requires TODO_TOKEN)
+  export [options]       Export every filtered task as CSV (requires TODO_TOKEN)
 
 List and search options:
   --page N               Page number, starting at 1 (default 1)
@@ -35,10 +37,15 @@ List and search options:
   --sort FIELD           id, title, priority, status or due_date (default id)
   --order DIR            asc or desc (default asc)
 
-Search filters (optional, combined with AND):
+Search and export filters (optional, combined with AND):
   --title TEXT           Literal title substring, case insensitive
   --priority VALUE       low, medium or high
   --status VALUE         pending, in_progress or done
+
+Export options (the export is never paginated):
+  --sort FIELD           id, title, priority, status or due_date (default id)
+  --order DIR            asc or desc (default asc)
+  --output FILE          Write the CSV to FILE instead of the standard output
 
 Task options, validated by the API with the same rules as the web form:
   --title TEXT           3 to 100 characters (required)
@@ -78,6 +85,9 @@ func run(args []string, getenv func(string) string, client *http.Client, stdout,
 	}
 	if args[0] == "delete" {
 		return runDelete(args[1:], base, getenv("TODO_TOKEN"), client, stdout, stderr)
+	}
+	if args[0] == "export" {
+		return runExport(args[1:], base, getenv("TODO_TOKEN"), client, stdout, stderr)
 	}
 	if len(args) != 1 || (args[0] != "health" && args[0] != "token" && args[0] != "session") {
 		_, _ = io.WriteString(stderr, usage)
@@ -345,6 +355,63 @@ func runDelete(args []string, base, token string, client *http.Client, stdout, s
 	}
 	_, _ = fmt.Fprintf(stderr, "API returned HTTP %d.\n", response.StatusCode)
 	return 1
+}
+
+// runExport downloads every task matching the filters from the CLI export
+// endpoint and writes the CSV to --output, or to the standard output when the
+// option is omitted. A file is only created after the API accepts the request,
+// and a partially written file is removed.
+func runExport(args []string, base, token string, client *http.Client, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("export", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	sortBy := flags.String("sort", "id", "")
+	order := flags.String("order", "asc", "")
+	title := flags.String("title", "", "")
+	priority := flags.String("priority", "", "")
+	status := flags.String("status", "", "")
+	output := flags.String("output", "", "")
+	if flags.Parse(args) != nil || flags.NArg() != 0 {
+		_, _ = io.WriteString(stderr, usage)
+		return 2
+	}
+	if token == "" {
+		_, _ = io.WriteString(stderr, "Set TODO_TOKEN.\n")
+		return 2
+	}
+	query := url.Values{"title": {*title}, "priority": {*priority}, "status": {*status}, "sort": {*sortBy}, "order": {*order}}
+	response, code := sendAuthorized(client, http.MethodGet, base+"/api/cli/records/export?"+query.Encode(), token, stderr)
+	if code != 0 {
+		return code
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusBadRequest {
+		_, _ = io.WriteString(stderr, "Invalid export options: check filters, --sort and --order.\n")
+		return 2
+	}
+	if response.StatusCode != http.StatusOK {
+		_, _ = fmt.Fprintf(stderr, "API returned HTTP %d.\n", response.StatusCode)
+		return 1
+	}
+	if *output == "" {
+		if _, err := io.Copy(stdout, response.Body); err != nil {
+			_, _ = io.WriteString(stderr, "Could not write the CSV.\n")
+			return 1
+		}
+		return 0
+	}
+	file, err := os.Create(*output)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "Could not create %s.\n", *output)
+		return 1
+	}
+	_, err = io.Copy(file, response.Body)
+	if err = errors.Join(err, file.Close()); err != nil {
+		_ = os.Remove(*output)
+		_, _ = io.WriteString(stderr, "Could not write the CSV.\n")
+		return 1
+	}
+	_, _ = fmt.Fprintf(stdout, "CSV saved to %s.\n", *output)
+	return 0
 }
 
 var invoke = func() int {
