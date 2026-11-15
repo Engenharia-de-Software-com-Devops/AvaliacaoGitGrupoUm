@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 	"time"
 )
 
@@ -23,6 +25,14 @@ Commands:
   session                Print the user authenticated by TODO_TOKEN
   create [options]       Create a task (requires TODO_TOKEN)
   update <id> [options]  Replace every field of a task (requires TODO_TOKEN)
+  list [options]         List tasks one page at a time (requires TODO_TOKEN)
+  delete <id>            Delete a task by id (requires TODO_TOKEN)
+
+List options:
+  --page N               Page number, starting at 1 (default 1)
+  --page-size N          Tasks per page, 1 to 100 (default 10)
+  --sort FIELD           id, title, priority, status or due_date (default id)
+  --order DIR            asc or desc (default asc)
 
 Task options, validated by the API with the same rules as the web form:
   --title TEXT           3 to 100 characters (required)
@@ -56,6 +66,12 @@ func run(args []string, getenv func(string) string, client *http.Client, stdout,
 	}
 	if args[0] == "create" || args[0] == "update" {
 		return runTask(args, base, getenv("TODO_TOKEN"), client, stdout, stderr)
+	}
+	if args[0] == "list" {
+		return runList(args[1:], base, getenv("TODO_TOKEN"), client, stdout, stderr)
+	}
+	if args[0] == "delete" {
+		return runDelete(args[1:], base, getenv("TODO_TOKEN"), client, stdout, stderr)
 	}
 	if len(args) != 1 || (args[0] != "health" && args[0] != "token" && args[0] != "session") {
 		_, _ = io.WriteString(stderr, usage)
@@ -201,6 +217,109 @@ func runTask(args []string, base, token string, client *http.Client, stdout, std
 			_, _ = fmt.Fprintf(stderr, "  %s: %s\n", field, result.Errors[field])
 		}
 		return 1
+	case http.StatusNotFound:
+		_, _ = fmt.Fprintf(stderr, "Task %d not found.\n", id)
+		return 1
+	}
+	_, _ = fmt.Fprintf(stderr, "API returned HTTP %d.\n", response.StatusCode)
+	return 1
+}
+
+// sendAuthorized sends a body-less request with the Bearer token. When the
+// request cannot be built or sent it prints the reason and returns exit code 1.
+func sendAuthorized(client *http.Client, method, address, token string, stderr io.Writer) (*http.Response, int) {
+	request, err := http.NewRequest(method, address, nil)
+	if err != nil {
+		_, _ = io.WriteString(stderr, "Invalid API URL.\n")
+		return nil, 1
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	response, err := client.Do(request)
+	if err != nil {
+		_, _ = io.WriteString(stderr, "API connection failed.\n")
+		return nil, 1
+	}
+	return response, 0
+}
+
+// runList prints one page of tasks from GET /api/cli/records as a text table.
+func runList(args []string, base, token string, client *http.Client, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("list", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	page := flags.Int("page", 1, "")
+	pageSize := flags.Int("page-size", 10, "")
+	sortBy := flags.String("sort", "id", "")
+	order := flags.String("order", "asc", "")
+	if flags.Parse(args) != nil || flags.NArg() != 0 {
+		_, _ = io.WriteString(stderr, usage)
+		return 2
+	}
+	if token == "" {
+		_, _ = io.WriteString(stderr, "Set TODO_TOKEN.\n")
+		return 2
+	}
+	query := url.Values{"page": {strconv.Itoa(*page)}, "page_size": {strconv.Itoa(*pageSize)}, "sort": {*sortBy}, "order": {*order}}
+	response, code := sendAuthorized(client, http.MethodGet, base+"/api/cli/records?"+query.Encode(), token, stderr)
+	if code != 0 {
+		return code
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusBadRequest {
+		_, _ = io.WriteString(stderr, "Invalid list options: --page from 1, --page-size from 1 to 100, --sort id, title, priority, status or due_date, --order asc or desc.\n")
+		return 2
+	}
+	if response.StatusCode != http.StatusOK {
+		_, _ = fmt.Fprintf(stderr, "API returned HTTP %d.\n", response.StatusCode)
+		return 1
+	}
+	var result struct {
+		Items      []task `json:"items"`
+		Page       int    `json:"page"`
+		Total      int    `json:"total"`
+		TotalPages int    `json:"total_pages"`
+	}
+	if json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&result) != nil {
+		_, _ = io.WriteString(stderr, "Invalid API response.\n")
+		return 1
+	}
+	if len(result.Items) == 0 {
+		_, _ = io.WriteString(stdout, "No tasks found.\n")
+	} else {
+		table := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+		_, _ = fmt.Fprintln(table, "ID\tTITLE\tPRIORITY\tSTATUS\tDUE DATE\tCATEGORY")
+		for _, item := range result.Items {
+			_, _ = fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%s\t%s\n", item.ID, item.Title, item.Priority, item.Status, item.DueDate, item.Category)
+		}
+		_ = table.Flush()
+	}
+	_, _ = fmt.Fprintf(stdout, "Page %d of %d (%d tasks)\n", result.Page, max(result.TotalPages, 1), result.Total)
+	return 0
+}
+
+// runDelete removes one task by id through DELETE /api/cli/records/{id}.
+func runDelete(args []string, base, token string, client *http.Client, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		_, _ = io.WriteString(stderr, usage)
+		return 2
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil || id < 1 {
+		_, _ = io.WriteString(stderr, "Task id must be a positive integer.\n")
+		return 2
+	}
+	if token == "" {
+		_, _ = io.WriteString(stderr, "Set TODO_TOKEN.\n")
+		return 2
+	}
+	response, code := sendAuthorized(client, http.MethodDelete, base+"/api/cli/records/"+strconv.FormatInt(id, 10), token, stderr)
+	if code != 0 {
+		return code
+	}
+	defer response.Body.Close()
+	switch response.StatusCode {
+	case http.StatusNoContent:
+		_, _ = fmt.Fprintf(stdout, "Task %d deleted.\n", id)
+		return 0
 	case http.StatusNotFound:
 		_, _ = fmt.Fprintf(stderr, "Task %d not found.\n", id)
 		return 1
