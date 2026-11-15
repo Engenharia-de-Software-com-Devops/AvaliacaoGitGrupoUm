@@ -237,6 +237,7 @@ func TestValidateTask(t *testing.T) {
 type fakeTasks struct {
 	saved     task
 	query     taskPageQuery
+	search    taskSearchQuery
 	id        int64
 	err       error
 	requestID string
@@ -277,6 +278,15 @@ func (f *fakeTasks) listWebTasks(_ context.Context, query taskPageQuery, request
 	stored := sampleTask
 	stored.ID = 7
 	return taskPage{Items: []task{stored}, Page: query.Page, PageSize: webPageSize, Total: 6, TotalPages: 2}, nil
+}
+
+func (f *fakeTasks) searchWebTasks(_ context.Context, query taskSearchQuery, requestID string) (taskPage, error) {
+	f.calls++
+	f.search, f.requestID = query, requestID
+	if f.err != nil {
+		return taskPage{}, f.err
+	}
+	return taskPage{Items: []task{sampleTask}, Page: query.Page, PageSize: webPageSize, Total: 1, TotalPages: 1}, nil
 }
 
 func (f *fakeTasks) deleteWebTask(_ context.Context, id int64, requestID string) error {
@@ -459,6 +469,65 @@ func TestWebTaskListAndDeleteFailures(t *testing.T) {
 				t.Fatalf("store calls = %d", store.calls)
 			}
 			if !strings.Contains(logs.String(), `"layer":"api","client":"web"`) || !strings.Contains(logs.String(), `"status":"error"`) {
+				t.Fatalf("failure not logged: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestWebTaskSearch(t *testing.T) {
+	for _, tc := range []struct {
+		name, query string
+		want        taskSearchQuery
+	}{
+		{name: "all tasks", want: taskSearchQuery{taskPageQuery: taskPageQuery{Page: 1, Sort: "id", Order: "asc"}}},
+		{name: "combined filters", query: "?title=+Git+&priority=high&status=pending&page=2&sort=title&order=desc", want: taskSearchQuery{taskPageQuery: taskPageQuery{Page: 2, Sort: "title", Order: "desc"}, Title: "Git", Priority: "high", Status: "pending"}},
+		{name: "literal special characters", query: "?title=%25_%27&priority=low&status=in_progress", want: taskSearchQuery{taskPageQuery: taskPageQuery{Page: 1, Sort: "id", Order: "asc"}, Title: "%_'", Priority: "low", Status: "in_progress"}},
+		{name: "other valid values", query: "?priority=medium&status=done", want: taskSearchQuery{taskPageQuery: taskPageQuery{Page: 1, Sort: "id", Order: "asc"}, Priority: "medium", Status: "done"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{}
+			server, logs := taskServer(store)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, taskRequest(http.MethodGet, "/api/web/records/search"+tc.query, "", true))
+			if response.Code != http.StatusOK || store.search != tc.want {
+				t.Fatalf("status = %d, query = %+v, want %+v", response.Code, store.search, tc.want)
+			}
+			var page taskPage
+			if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil || page.Items[0].Title != sampleTask.Title || page.PageSize != 5 {
+				t.Fatalf("invalid search response: %s", response.Body.String())
+			}
+			if store.requestID == "" || !strings.Contains(logs.String(), `"operation":"search","status":"success","request_id":"`+store.requestID+`"`) {
+				t.Fatalf("search API log not correlated: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestWebTaskSearchFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, query   string
+		authenticated bool
+		storeErr      error
+		want          int
+	}{
+		{name: "unauthenticated", want: http.StatusUnauthorized},
+		{name: "invalid page", query: "?page=0", authenticated: true, want: http.StatusBadRequest},
+		{name: "invalid sort", query: "?sort=title%3BDROP", authenticated: true, want: http.StatusBadRequest},
+		{name: "invalid priority", query: "?priority=urgent", authenticated: true, want: http.StatusBadRequest},
+		{name: "invalid status", query: "?status=unknown", authenticated: true, want: http.StatusBadRequest},
+		{name: "title too long", query: "?title=" + strings.Repeat("a", 101), authenticated: true, want: http.StatusBadRequest},
+		{name: "store error", authenticated: true, storeErr: errors.New("database down"), want: http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{err: tc.storeErr}
+			server, logs := taskServer(store)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, taskRequest(http.MethodGet, "/api/web/records/search"+tc.query, "", tc.authenticated))
+			if response.Code != tc.want || (store.calls > 0) != (tc.storeErr != nil) {
+				t.Fatalf("status = %d, store calls = %d", response.Code, store.calls)
+			}
+			if !strings.Contains(logs.String(), `"operation":"search","status":"error"`) {
 				t.Fatalf("failure not logged: %s", logs.String())
 			}
 		})

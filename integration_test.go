@@ -171,7 +171,8 @@ func TestIntegration(t *testing.T) {
 	}
 	// Six more tasks guarantee at least two pages of five.
 	ids := []int64{created.ID}
-	for _, title := range []string{"Listing f", "Listing b", "Listing d", "Listing a", "Listing e", "Listing c"} {
+	prefix := fmt.Sprintf("SearchRun%d", time.Now().UnixNano())
+	for _, title := range []string{prefix + " f", prefix + " b", prefix + " d", prefix + " a", prefix + " e", prefix + " %_literal"} {
 		status, body := call(http.MethodPost, "/api/web/records", strings.Replace(newTask, "Integration task", title, 1), true)
 		var extra struct {
 			ID int64 `json:"id"`
@@ -209,6 +210,51 @@ func TestIntegration(t *testing.T) {
 	last := list(fmt.Sprintf("?sort=title&order=asc&page=%d", first.TotalPages))
 	if len(last.Items) < 1 || len(last.Items) > 5 {
 		t.Fatalf("last page = %+v", last)
+	}
+	if status, _ := call(http.MethodGet, "/api/web/records/search", "", false); status != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated search status = %d", status)
+	}
+	for _, invalid := range []string{"?priority=urgent", "?status=unknown", "?sort=description", "?page=0"} {
+		if status, _ := call(http.MethodGet, "/api/web/records/search"+invalid, "", true); status != http.StatusBadRequest {
+			t.Fatalf("invalid search %s status = %d", invalid, status)
+		}
+	}
+	search := func(values url.Values) listPage {
+		status, body := call(http.MethodGet, "/api/web/records/search?"+values.Encode(), "", true)
+		var result listPage
+		if status != http.StatusOK || json.Unmarshal(body, &result) != nil {
+			t.Fatalf("search status = %d, body %s", status, body)
+		}
+		return result
+	}
+	filters := url.Values{"title": {strings.ToLower(prefix)}, "priority": {"high"}, "status": {"pending"}, "sort": {"title"}, "order": {"asc"}}
+	for _, values := range []url.Values{
+		{"title": {prefix}},
+		{"title": {prefix}, "priority": {"high"}},
+		{"title": {prefix}, "status": {"pending"}},
+	} {
+		if result := search(values); result.Total != 6 {
+			t.Fatalf("partial filters %v = %+v", values, result)
+		}
+	}
+	filtered := search(filters)
+	if filtered.Total != 6 || filtered.TotalPages != 2 || len(filtered.Items) != 5 {
+		t.Fatalf("combined search first page = %+v", filtered)
+	}
+	for _, item := range filtered.Items {
+		if !strings.HasPrefix(item.Title, prefix) {
+			t.Fatalf("unrelated search result = %+v", item)
+		}
+	}
+	filters.Set("page", "2")
+	if second := search(filters); second.Total != 6 || len(second.Items) != 1 {
+		t.Fatalf("combined search second page = %+v", second)
+	}
+	if literal := search(url.Values{"title": {prefix + " %_"}}); literal.Total != 1 || len(literal.Items) != 1 {
+		t.Fatalf("literal search = %+v", literal)
+	}
+	if none := search(url.Values{"title": {prefix}, "priority": {"low"}, "status": {"pending"}}); none.Total != 0 || len(none.Items) != 0 {
+		t.Fatalf("nonmatching search = %+v", none)
 	}
 	if status, _ := call(http.MethodDelete, recordPath, "", true); status != http.StatusNoContent {
 		t.Fatalf("delete status = %d", status)

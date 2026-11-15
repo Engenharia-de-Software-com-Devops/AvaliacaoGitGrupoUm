@@ -167,3 +167,34 @@ docker compose logs -f app | grep -E '"operation":"(list|select|delete)"'
 Os testes unitários cobrem a leitura e a validação dos parâmetros, as respostas 200/204/400/401/404/500, a ordenação de cada coluna, a paginação e as falhas do banco, e rodam com os mesmos comandos da seção de testes da issue #1. O teste de integração cria tarefas suficientes para duas páginas, confere 5 itens na primeira página e a ordenação por título, exclui uma tarefa, confirma o 404 ao repetir a exclusão e verifica no PostgreSQL que o registro foi removido.
 
 Em clones no Windows com `core.autocrlf=true`, o arquivo `.gitattributes` mantém os scripts `.sh` com quebras de linha LF, para que `tools/coverage.sh` rode no contêiner Linux.
+
+## Issue #4 — Busca avançada de tarefas (Web)
+
+### Usar pela Web
+
+Após entrar, use **Busca avançada** acima da tabela para combinar os filtros **Título contém**, **Prioridade** e **Situação**. Clique em **Buscar** para atualizar a tabela sem recarregar a página. O título é procurado como texto literal, sem diferenciar maiúsculas de minúsculas; prioridade e situação usam os valores exatos escolhidos. Campos vazios não restringem os resultados.
+
+A busca preserva a ordenação e a paginação de cinco tarefas, calculando os totais sobre os resultados filtrados. Buscar ou clicar em **Limpar filtros** volta à primeira página; limpar remove os filtros e retorna à listagem completa. A tabela permanece filtrada ao ordenar, navegar, cadastrar, editar ou excluir tarefas.
+
+### Endpoint
+
+`GET /api/web/records/search` exige a sessão obtida no login e retorna **401** sem sessão válida. Aceita os seguintes parâmetros opcionais, combinados com `AND`:
+
+| Parâmetro | Valores |
+|---|---|
+| `title` | Trecho literal de até 100 caracteres; ignora maiúsculas/minúsculas e espaços nas extremidades |
+| `priority` | `low`, `medium` ou `high` |
+| `status` | `pending`, `in_progress` ou `done` |
+| `page`, `sort`, `order` | Mesmos valores e padrões da listagem da issue #3 |
+
+Valores inválidos retornam HTTP 400. Sem filtros, a busca retorna todas as tarefas, paginadas; a resposta tem o mesmo formato da listagem (`items`, `page`, `page_size`, `total`, `total_pages`). O endpoint usa consulta SQL própria e parametrizada.
+
+### Logs e testes
+
+A busca gera `operation: "search"` na API e no banco, correlacionados pelo mesmo `request_id`; requisições rejeitadas antes do acesso ao banco geram somente o log da API. Para acompanhar:
+
+```bash
+docker compose logs -f app | grep '"operation":"search"'
+```
+
+Os testes e a cobertura usam os comandos da issue #1. O teste de integração verifica combinações de filtros, paginação, caracteres literais, filtros inválidos e acesso sem sessão no PostgreSQL real.
