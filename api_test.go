@@ -398,6 +398,14 @@ func (f *fakeTasks) exportWebTasks(_ context.Context, query taskExportQuery, req
 	return f.exported, nil
 }
 
+func (f *fakeTasks) createCLITask(_ context.Context, input task, requestID string) (task, error) {
+	return f.record(0, input, requestID)
+}
+
+func (f *fakeTasks) updateCLITask(_ context.Context, id int64, input task, requestID string) (task, error) {
+	return f.record(id, input, requestID)
+}
+
 func (f *fakeTasks) deleteWebTask(_ context.Context, id int64, requestID string) error {
 	f.calls++
 	f.id, f.requestID = id, requestID
@@ -775,5 +783,114 @@ func TestWebDashboardFailures(t *testing.T) {
 				t.Fatalf("failure not logged: %s", logs.String())
 			}
 		})
+	}
+}
+
+func cliTaskRequest(method, path, body, token string) *http.Request {
+	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	return request
+}
+
+func cliTaskServer(store *fakeTasks) (*server, *bytes.Buffer) {
+	server, logs := taskServer(store)
+	server.cliTokens["cli-valid"] = session{username: "alice", expires: time.Now().Add(time.Hour)}
+	server.cliTokens["cli-expired"] = session{username: "alice", expires: time.Now().Add(-time.Hour)}
+	return server, logs
+}
+
+func TestCLITaskEndpoints(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path, operation string
+		wantID                        int64
+		wantStatus                    int
+	}{
+		{name: "create", method: http.MethodPost, path: "/api/cli/records", operation: "create", wantID: 42, wantStatus: http.StatusCreated},
+		{name: "update", method: http.MethodPut, path: "/api/cli/records/7", operation: "update", wantID: 7, wantStatus: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{}
+			server, logs := cliTaskServer(store)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, cliTaskRequest(tc.method, tc.path, validTaskJSON, "cli-valid"))
+			if response.Code != tc.wantStatus || response.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("status = %d, body %s", response.Code, response.Body.String())
+			}
+			var got task
+			if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil || got.ID != tc.wantID || got.Title != "Write report" {
+				t.Fatalf("response task = %+v, %v", got, err)
+			}
+			if store.id != tc.wantID%42 || store.saved.Title != "Write report" {
+				t.Fatalf("store received id %d and %+v", store.id, store.saved)
+			}
+			want := `"layer":"api","client":"cli","operation":"` + tc.operation + `","status":"success","request_id":"` + store.requestID + `"`
+			if store.requestID == "" || !strings.Contains(logs.String(), want) {
+				t.Fatalf("API log not correlated: %s", logs.String())
+			}
+			if strings.Contains(logs.String(), "cli-valid") {
+				t.Fatal("token leaked in logs")
+			}
+		})
+	}
+}
+
+func TestCLITaskEndpointFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path, body, token string
+		webCookie                       bool
+		storeErr                        error
+		want                            int
+		wantErrors                      bool
+	}{
+		{name: "create without token", method: http.MethodPost, path: "/api/cli/records", body: validTaskJSON, want: http.StatusUnauthorized},
+		{name: "update without token", method: http.MethodPut, path: "/api/cli/records/7", body: validTaskJSON, want: http.StatusUnauthorized},
+		{name: "invalid token", method: http.MethodPost, path: "/api/cli/records", body: validTaskJSON, token: "forged", want: http.StatusUnauthorized},
+		{name: "expired token", method: http.MethodPost, path: "/api/cli/records", body: validTaskJSON, token: "cli-expired", want: http.StatusUnauthorized},
+		{name: "web session is not a CLI token", method: http.MethodPost, path: "/api/cli/records", body: validTaskJSON, webCookie: true, want: http.StatusUnauthorized},
+		{name: "invalid JSON", method: http.MethodPost, path: "/api/cli/records", body: "{", token: "cli-valid", want: http.StatusBadRequest},
+		{name: "unknown field", method: http.MethodPut, path: "/api/cli/records/7", body: `{"owner":"bob"}`, token: "cli-valid", want: http.StatusBadRequest},
+		{name: "validation errors", method: http.MethodPost, path: "/api/cli/records", body: `{"title":"ab"}`, token: "cli-valid", want: http.StatusUnprocessableEntity, wantErrors: true},
+		{name: "update missing task", method: http.MethodPut, path: "/api/cli/records/7", body: validTaskJSON, token: "cli-valid", storeErr: errTaskNotFound, want: http.StatusNotFound},
+		{name: "storage failure", method: http.MethodPost, path: "/api/cli/records", body: validTaskJSON, token: "cli-valid", storeErr: errors.New("database down"), want: http.StatusInternalServerError},
+		{name: "non numeric id", method: http.MethodPut, path: "/api/cli/records/abc", body: validTaskJSON, token: "cli-valid", want: http.StatusNotFound},
+		{name: "zero id", method: http.MethodPut, path: "/api/cli/records/0", body: validTaskJSON, token: "cli-valid", want: http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{err: tc.storeErr}
+			server, logs := cliTaskServer(store)
+			request := cliTaskRequest(tc.method, tc.path, tc.body, tc.token)
+			if tc.webCookie {
+				request.AddCookie(&http.Cookie{Name: "session", Value: "valid"})
+			}
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, request)
+			if response.Code != tc.want {
+				t.Fatalf("status = %d, want %d (%s)", response.Code, tc.want, response.Body.String())
+			}
+			if (tc.storeErr == nil) != (store.calls == 0) {
+				t.Fatalf("store calls = %d", store.calls)
+			}
+			if tc.wantErrors {
+				var body struct{ Errors map[string]string }
+				if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || len(body.Errors) != 5 {
+					t.Fatalf("validation body = %s", response.Body.String())
+				}
+			}
+			if !strings.Contains(logs.String(), `"layer":"api","client":"cli"`) || !strings.Contains(logs.String(), `"status":"error"`) {
+				t.Fatalf("failure not logged: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestCLITokenDoesNotAuthorizeWebEndpoints(t *testing.T) {
+	store := &fakeTasks{}
+	server, _ := cliTaskServer(store)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, cliTaskRequest(http.MethodPost, "/api/web/records", validTaskJSON, "cli-valid"))
+	if response.Code != http.StatusUnauthorized || store.calls != 0 {
+		t.Fatalf("web endpoint accepted a CLI token: %d", response.Code)
 	}
 }
