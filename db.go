@@ -260,3 +260,43 @@ func (d *database) deleteWebTask(ctx context.Context, id int64, requestID string
 	}
 	return nil
 }
+
+// taskExportQuery carries the web search filters and ordering of a CSV export.
+// It has no page: the export always contains every matching task.
+type taskExportQuery struct {
+	Title    string
+	Priority string
+	Status   string
+	Sort     string
+	Order    string
+}
+
+// exportWebTasks uses its own web query to return every task matching the
+// filters, in the requested order and without LIMIT/OFFSET.
+func (d *database) exportWebTasks(ctx context.Context, query taskExportQuery, requestID string) (items []task, err error) {
+	defer func() { d.logOutcome("export", requestID, "Web task export loaded", err) }()
+	direction := "ASC"
+	if query.Order == "desc" {
+		direction = "DESC"
+	}
+	rows, err := d.conn.QueryContext(ctx, `SELECT `+webTaskColumns+` FROM tasks
+		WHERE ($1 = '' OR strpos(lower(title), lower($1)) > 0) AND ($2 = '' OR priority = $2) AND ($3 = '' OR status = $3)
+		ORDER BY `+webTaskSortColumns[query.Sort]+` `+direction+`, id `+direction,
+		query.Title, query.Priority, query.Status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items = []task{}
+	for rows.Next() {
+		var item task
+		if err = rows.Scan(&item.ID, &item.Title, &item.Description, &item.Priority, &item.Status, &item.DueDate, &item.Category); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
