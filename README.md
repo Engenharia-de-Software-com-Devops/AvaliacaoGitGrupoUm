@@ -384,3 +384,72 @@ docker compose logs -f app | grep '"client":"cli"' | grep -E '"operation":"(crea
 ```
 
 Os testes e a cobertura usam os comandos da issue #7. Os testes unitários cobrem as opções e os códigos de saída da CLI, o corpo e os cabeçalhos enviados, as respostas 201/200/401/404/422, a rejeição do cookie Web nos endpoints CLI e as consultas SQL da CLI. O teste de integração executa a CLI real contra a API do Compose, cadastra e edita uma tarefa e confirma pela API Web que ela foi persistida e aparece na Web.
+
+## Issue #9 — Listagem e exclusão de tarefas (CLI)
+
+Os comandos usam o token da seção **Issue #7** (variável `TODO_TOKEN`), com a aplicação rodando por `docker compose up --build` em outro terminal. A CLI chama somente endpoints próprios da API; nunca acessa o banco.
+
+### Listar
+
+```bash
+docker compose --profile cli run --rm --no-deps cli list
+docker compose --profile cli run --rm --no-deps cli list --page 2 --page-size 3
+docker compose --profile cli run --rm --no-deps cli list --sort priority --order desc
+```
+
+| Opção | Valores | Padrão |
+|---|---|---|
+| `--page` | número da página, a partir de 1 | `1` |
+| `--page-size` | tarefas por página, de 1 a 100 | `10` |
+| `--sort` | `id`, `title`, `priority`, `status` ou `due_date` | `id` |
+| `--order` | `asc` ou `desc` | `asc` |
+
+A saída é uma tabela em texto seguida do rodapé de paginação:
+
+```text
+ID  TITLE         PRIORITY  STATUS   DUE DATE    CATEGORY
+22  Comprar café  low       pending  2026-11-16  casa
+23  Revisar PR    high      pending  2026-11-17  trabalho
+24  Gravar vídeo  medium    pending  2026-11-24  estudos
+Page 2 of 2 (6 tasks)
+```
+
+A ordenação segue as mesmas regras da tabela Web (issue #3): título sem diferenciar maiúsculas e minúsculas, prioridade de baixa para alta, situação de pendente para concluída, e o `id` como desempate. Uma página além da última mostra `No tasks found.`.
+
+### Excluir
+
+```bash
+docker compose --profile cli run --rm --no-deps cli delete 24
+```
+
+Imprime `Task 24 deleted.`. O `<id>` é o mesmo exibido no `list`, na saída do `create` e na tabela Web. A tarefa excluída some da tabela Web ao recarregar a página ou atualizar a listagem.
+
+| Situação | Mensagem | Código de saída |
+|---|---|---|
+| Opção desconhecida, argumento extra ou `delete` sem id | ajuda de uso | 2 |
+| Id não numérico ou menor que 1 | `Task id must be a positive integer.` | 2 |
+| `TODO_TOKEN` ausente | `Set TODO_TOKEN.` | 2 |
+| Opção de listagem fora dos valores aceitos (HTTP 400) | `Invalid list options: ...` | 2 |
+| Tarefa inexistente no `delete` (HTTP 404) | `Task <id> not found.` | 1 |
+| Token inválido ou expirado (HTTP 401) | `API returned HTTP 401.` | 1 |
+
+### Endpoints
+
+| Método e rota | Função | Respostas |
+|---|---|---|
+| `GET /api/cli/records?page=&page_size=&sort=&order=` | Lista uma página de tarefas | 200 com `items`, `page`, `page_size`, `total` e `total_pages`; 400; 401 |
+| `DELETE /api/cli/records/{id}` | Exclui uma tarefa | 204 sem corpo; 401; 404 |
+
+Os dois exigem `Authorization: Bearer <token>`; o cookie de sessão da Web não é aceito, e o token da CLI não é aceito em `GET /api/web/records` nem em `DELETE /api/web/records/{id}`. As consultas SQL de contagem, listagem e exclusão da CLI são próprias, separadas das usadas pela Web, mas operam sobre a mesma tabela `tasks`.
+
+### Logs e testes
+
+A listagem gera `operation: "list"` na API e `operation: "select"` no banco; a exclusão gera `operation: "delete"` nas duas camadas. Todos usam `client: "cli"` e o mesmo `request_id`. O token não é registrado.
+
+```bash
+docker compose logs -f app | grep '"client":"cli"' | grep -E '"operation":"(list|select|delete)"'
+```
+
+Os testes e a cobertura usam os comandos da issue #7. Os testes unitários cobrem as opções, a tabela e os códigos de saída da CLI, os parâmetros e as respostas 200/204/400/401/404/500 da API, a separação entre token da CLI e cookie da Web e as consultas SQL da CLI. O teste de integração executa a CLI real: lista com ordenação e uma tarefa por página, confere que o total é igual ao da listagem Web, exclui a tarefa e confirma pela API Web que ela não existe mais.
+
+O teste de integração do `update` de tarefa inexistente (#8) passou a informar `--status`: sem ele a API responde 422 (situação obrigatória na edição) antes de procurar a tarefa, e o teste esperava a mensagem de tarefa não encontrada.
