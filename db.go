@@ -418,3 +418,72 @@ func (d *database) updateCLITask(ctx context.Context, id int64, input task, requ
 		RETURNING `+cliTaskColumns,
 		input.Title, input.Description, input.Priority, input.Status, input.DueDate, input.Category, id))
 }
+
+// cliTaskSortColumns maps each sortable CLI column to its ORDER BY expression in
+// the CLI listing query. Priority and status sort by their logical rank. The API
+// only accepts keys from this map, so no user input reaches the SQL text.
+var cliTaskSortColumns = map[string]string{
+	"id":       "cli_task.id",
+	"title":    "lower(cli_task.title)",
+	"priority": "CASE cli_task.priority WHEN 'low' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END",
+	"status":   "CASE cli_task.status WHEN 'pending' THEN 1 WHEN 'in_progress' THEN 2 ELSE 3 END",
+	"due_date": "cli_task.due_date",
+}
+
+// cliPageQuery selects one page of the CLI listing, its size and ordering.
+type cliPageQuery struct {
+	Page     int
+	PageSize int
+	Sort     string
+	Order    string
+}
+
+// listCLITasks loads one page of tasks for the CLI with its own count and select queries.
+func (d *database) listCLITasks(ctx context.Context, query cliPageQuery, requestID string) (page taskPage, err error) {
+	defer func() { d.logCLIOutcome("select", requestID, "CLI task page loaded", err) }()
+	page = taskPage{Items: []task{}, Page: query.Page, PageSize: query.PageSize}
+	if err = d.conn.QueryRowContext(ctx, `SELECT COUNT(cli_task.id) FROM tasks AS cli_task`).Scan(&page.Total); err != nil {
+		return taskPage{}, err
+	}
+	page.TotalPages = (page.Total + query.PageSize - 1) / query.PageSize
+	direction := "ASC"
+	if query.Order == "desc" {
+		direction = "DESC"
+	}
+	rows, err := d.conn.QueryContext(ctx, `SELECT cli_task.id, cli_task.title, cli_task.description, cli_task.priority, cli_task.status,
+		to_char(cli_task.due_date, 'YYYY-MM-DD'), cli_task.category
+		FROM tasks AS cli_task ORDER BY `+cliTaskSortColumns[query.Sort]+` `+direction+`, cli_task.id `+direction+` LIMIT $1 OFFSET $2`,
+		query.PageSize, (query.Page-1)*query.PageSize)
+	if err != nil {
+		return taskPage{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item task
+		if err = rows.Scan(&item.ID, &item.Title, &item.Description, &item.Priority, &item.Status, &item.DueDate, &item.Category); err != nil {
+			return taskPage{}, err
+		}
+		page.Items = append(page.Items, item)
+	}
+	if err = rows.Err(); err != nil {
+		return taskPage{}, err
+	}
+	return page, nil
+}
+
+// deleteCLITask removes a task by id for the CLI and maps a missing row to errTaskNotFound.
+func (d *database) deleteCLITask(ctx context.Context, id int64, requestID string) (err error) {
+	defer func() { d.logCLIOutcome("delete", requestID, "CLI task deleted", err) }()
+	result, err := d.conn.ExecContext(ctx, `DELETE FROM tasks AS cli_task WHERE cli_task.id = $1`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return errTaskNotFound
+	}
+	return nil
+}
