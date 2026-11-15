@@ -539,3 +539,62 @@ docker compose logs -f app | grep '"client":"cli"' | grep '"operation":"export"'
 ```
 
 Os testes e a cobertura usam os comandos da seção **Issue #7**. Os testes unitários cobrem as opções e os códigos de saída do comando, a gravação na saída padrão e em arquivo, a remoção de arquivo incompleto, o endpoint (CSV exato, filtros, paginação ignorada, 400/401/500, cookie Web recusado) e a consulta SQL sem paginação. O teste de integração compara, com o PostgreSQL real, o CSV da CLI com o da Web: pelo endpoint com `page` e `page_size`, pela CLI na saída padrão, com `--output` e sem filtros.
+
+## Issue #12 — Indicadores (CLI)
+
+O comando usa o token da seção **Issue #7** (variável `TODO_TOKEN`), com a aplicação rodando por `docker compose up --build` em outro terminal. A CLI chama somente o endpoint próprio da API; nunca acessa o banco.
+
+### Exibir os indicadores
+
+```bash
+docker compose --profile cli run --rm --no-deps cli dashboard
+```
+
+A saída mostra, em texto, **os mesmos três indicadores e valores do dashboard Web** (seção **Issue #6**): tarefas por situação, por prioridade e por categoria, cada valor com sua quantidade e o percentual do total.
+
+```text
+Total: 5 tasks
+
+Tasks by status
+  pending          2   40%
+  in_progress      1   20%
+  done             2   40%
+
+Tasks by priority
+  low              1   20%
+  medium           2   40%
+  high             2   40%
+
+Tasks by category
+  casa             2   40%
+  estudos          2   40%
+  trabalho         1   20%
+```
+
+| Seção | Corresponde no dashboard Web | Ordem |
+|---|---|---|
+| `Tasks by status` | Rosca **Tarefas por situação** | `pending`, `in_progress`, `done`, sempre as três, inclusive com zero |
+| `Tasks by priority` | Colunas **Tarefas por prioridade** | `low`, `medium`, `high`, sempre as três, inclusive com zero |
+| `Tasks by category` | Barras **Tarefas por categoria** | da categoria mais numerosa para a menos numerosa; empate em ordem alfabética |
+
+Os percentuais são arredondados como na Web. Sem tarefas, o comando mostra zeros e `(none)` em categorias.
+
+| Situação | Mensagem | Código de saída |
+|---|---|---|
+| Argumento extra | ajuda de uso | 2 |
+| `TODO_TOKEN` ausente | `Set TODO_TOKEN.` | 2 |
+| Token inválido ou expirado (HTTP 401) | `API returned HTTP 401.` | 1 |
+
+### Endpoint
+
+`GET /api/cli/dashboard` exige `Authorization: Bearer <token>` e retorna **HTTP 401** sem token válido; o cookie de sessão da Web não é aceito, e o token da CLI não é aceito em `GET /api/web/dashboard`. Responde 200 com o mesmo formato JSON do endpoint Web (`total`, `by_status`, `by_priority`, `by_category`), calculado no PostgreSQL por consultas `GROUP BY` próprias da CLI, separadas das consultas da Web.
+
+### Logs e testes
+
+Cada execução gera `operation: "dashboard"` com `client: "cli"` na API e no banco, com o mesmo `request_id`; sem token válido, só o log da API com `status: "error"`. O token não é registrado.
+
+```bash
+docker compose logs -f app | grep '"client":"cli"' | grep '"operation":"dashboard"'
+```
+
+Os testes e a cobertura usam os comandos da issue #7. Os testes unitários cobrem a saída e os códigos de saída da CLI (inclusive banco vazio e alinhamento das colunas), as respostas 200/401/500 da API, a separação entre token da CLI e cookie da Web e as três consultas da CLI. O teste de integração executa o comando real `dashboard` e confere, linha a linha, que seções, chaves e quantidades são iguais às do `GET /api/web/dashboard` no mesmo banco.
