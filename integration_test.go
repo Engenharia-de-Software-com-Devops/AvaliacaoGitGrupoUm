@@ -160,5 +160,70 @@ func TestIntegration(t *testing.T) {
 	if title != "Integration task edited" || taskStatus != "done" || dueDate != "2026-11-20" {
 		t.Fatalf("persisted task = %q %q %q", title, taskStatus, dueDate)
 	}
-	fmt.Println("health, login, authenticated session, rejection, password hash and task create/edit persistence verified")
+	if status, _ := call(http.MethodGet, "/api/web/records", "", false); status != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated list status = %d", status)
+	}
+	if status, _ := call(http.MethodDelete, recordPath, "", false); status != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated delete status = %d", status)
+	}
+	if status, _ := call(http.MethodGet, "/api/web/records?sort=description", "", true); status != http.StatusBadRequest {
+		t.Fatalf("invalid sort status = %d", status)
+	}
+	// Six more tasks guarantee at least two pages of five.
+	ids := []int64{created.ID}
+	for _, title := range []string{"Listing f", "Listing b", "Listing d", "Listing a", "Listing e", "Listing c"} {
+		status, body := call(http.MethodPost, "/api/web/records", strings.Replace(newTask, "Integration task", title, 1), true)
+		var extra struct {
+			ID int64 `json:"id"`
+		}
+		if status != http.StatusCreated || json.Unmarshal(body, &extra) != nil {
+			t.Fatalf("create listing task status = %d, body %s", status, body)
+		}
+		ids = append(ids, extra.ID)
+	}
+	type listPage struct {
+		Items []struct {
+			ID    int64  `json:"id"`
+			Title string `json:"title"`
+		} `json:"items"`
+		Total      int `json:"total"`
+		TotalPages int `json:"total_pages"`
+	}
+	list := func(query string) listPage {
+		status, body := call(http.MethodGet, "/api/web/records"+query, "", true)
+		var page listPage
+		if status != http.StatusOK || json.Unmarshal(body, &page) != nil {
+			t.Fatalf("list %s status = %d, body %s", query, status, body)
+		}
+		return page
+	}
+	first := list("?sort=title&order=asc")
+	if len(first.Items) != 5 || first.Total < 7 || first.TotalPages < 2 {
+		t.Fatalf("first page = %+v", first)
+	}
+	for i := 1; i < len(first.Items); i++ {
+		if strings.ToLower(first.Items[i-1].Title) > strings.ToLower(first.Items[i].Title) {
+			t.Fatalf("titles not ascending: %+v", first.Items)
+		}
+	}
+	last := list(fmt.Sprintf("?sort=title&order=asc&page=%d", first.TotalPages))
+	if len(last.Items) < 1 || len(last.Items) > 5 {
+		t.Fatalf("last page = %+v", last)
+	}
+	if status, _ := call(http.MethodDelete, recordPath, "", true); status != http.StatusNoContent {
+		t.Fatalf("delete status = %d", status)
+	}
+	if status, _ := call(http.MethodDelete, recordPath, "", true); status != http.StatusNotFound {
+		t.Fatalf("repeated delete status = %d, want 404", status)
+	}
+	var remaining int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM tasks WHERE id = $1`, created.ID).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("deleted task still persisted: %d, %v", remaining, err)
+	}
+	for _, id := range ids[1:] {
+		if status, _ := call(http.MethodDelete, fmt.Sprintf("/api/web/records/%d", id), "", true); status != http.StatusNoContent {
+			t.Fatalf("cleanup delete %d status = %d", id, status)
+		}
+	}
+	fmt.Println("health, login, authenticated session, rejection, password hash, task create/edit persistence, paginated sorted listing and deletion verified")
 }
