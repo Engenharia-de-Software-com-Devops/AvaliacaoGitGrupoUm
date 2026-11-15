@@ -569,3 +569,34 @@ func (d *database) exportCLITasks(ctx context.Context, query cliExportQuery, req
 	}
 	return items, nil
 }
+
+// The CLI indicators are the same three of the web dashboard, computed with
+// CLI-specific queries: status and priority list every allowed value in logical
+// order (including zero counts) and categories go from most to least frequent.
+const (
+	cliDashboardStatusQuery = `SELECT cli_status.key, COUNT(cli_task.id)
+		FROM (VALUES (1, 'pending'), (2, 'in_progress'), (3, 'done')) AS cli_status(rank, key) LEFT JOIN tasks AS cli_task ON cli_task.status = cli_status.key
+		GROUP BY cli_status.rank, cli_status.key ORDER BY cli_status.rank`
+	cliDashboardPriorityQuery = `SELECT cli_priority.key, COUNT(cli_task.id)
+		FROM (VALUES (1, 'low'), (2, 'medium'), (3, 'high')) AS cli_priority(rank, key) LEFT JOIN tasks AS cli_task ON cli_task.priority = cli_priority.key
+		GROUP BY cli_priority.rank, cli_priority.key ORDER BY cli_priority.rank`
+	cliDashboardCategoryQuery = `SELECT cli_task.category, COUNT(cli_task.id) FROM tasks AS cli_task GROUP BY cli_task.category ORDER BY COUNT(cli_task.id) DESC, cli_task.category`
+)
+
+// cliDashboard aggregates the CLI indicators in the database with its own queries.
+func (d *database) cliDashboard(ctx context.Context, requestID string) (result dashboard, err error) {
+	defer func() { d.logCLIOutcome("dashboard", requestID, "CLI dashboard indicators loaded", err) }()
+	if result.ByStatus, err = d.countBy(ctx, cliDashboardStatusQuery); err != nil {
+		return dashboard{}, err
+	}
+	if result.ByPriority, err = d.countBy(ctx, cliDashboardPriorityQuery); err != nil {
+		return dashboard{}, err
+	}
+	if result.ByCategory, err = d.countBy(ctx, cliDashboardCategoryQuery); err != nil {
+		return dashboard{}, err
+	}
+	for _, item := range result.ByStatus {
+		result.Total += item.Count
+	}
+	return result, nil
+}
