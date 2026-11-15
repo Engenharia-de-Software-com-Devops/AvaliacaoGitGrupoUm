@@ -388,3 +388,33 @@ func (d *database) webDashboard(ctx context.Context, requestID string) (result d
 	}
 	return result, nil
 }
+
+// cliTaskColumns is the column list returned by the CLI task queries.
+const cliTaskColumns = `id, title, description, priority, status, to_char(due_date, 'YYYY-MM-DD') AS due_date, category`
+
+func (d *database) logCLIOutcome(operation, requestID, message string, err error) {
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	logClientEvent(d.logs, "db", "cli", operation, status, requestID, message)
+}
+
+// createCLITask persists a task sent by the CLI using its own SQL statement.
+func (d *database) createCLITask(ctx context.Context, input task, requestID string) (created task, err error) {
+	defer func() { d.logCLIOutcome("insert", requestID, "CLI task persisted", err) }()
+	return scanTask(d.conn.QueryRowContext(ctx, `INSERT INTO tasks AS cli_task (title, description, priority, status, due_date, category)
+		VALUES ($1, $2, $3, $4, CAST($5 AS date), $6)
+		RETURNING `+cliTaskColumns,
+		input.Title, input.Description, input.Priority, input.Status, input.DueDate, input.Category))
+}
+
+// updateCLITask replaces every field of a task edited by the CLI using its own SQL statement.
+func (d *database) updateCLITask(ctx context.Context, id int64, input task, requestID string) (updated task, err error) {
+	defer func() { d.logCLIOutcome("update", requestID, "CLI task updated", err) }()
+	return scanTask(d.conn.QueryRowContext(ctx, `UPDATE tasks SET title = $1, description = $2, priority = $3, status = $4,
+		due_date = CAST($5 AS date), category = $6, updated_at = now()
+		WHERE tasks.id = $7
+		RETURNING `+cliTaskColumns,
+		input.Title, input.Description, input.Priority, input.Status, input.DueDate, input.Category, id))
+}
