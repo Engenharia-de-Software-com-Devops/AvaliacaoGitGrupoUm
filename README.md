@@ -91,9 +91,7 @@ Espaços no início e no fim dos textos são removidos antes da validação. As 
 
 1. Inicie a aplicação com `docker compose up --build` e entre em <http://localhost:8080>.
 2. Após o login, preencha o formulário **Nova tarefa** e clique em **Cadastrar tarefa**. Campos inválidos ficam destacados, com a mensagem de erro ao lado.
-3. Para editar, clique em **Editar** em uma tarefa da lista **Salvas nesta sessão** ou informe o ID em **Editar tarefa existente** e clique em **Carregar**. Altere os campos e clique em **Salvar alterações**; **Cancelar edição** volta ao modo de cadastro.
-
-A listagem completa das tarefas do banco será entregue na issue #3.
+3. Para editar, clique em **Editar** em uma tarefa da tabela **Tarefas** (issue #3) ou informe o ID em **Editar tarefa existente** e clique em **Carregar**. Altere os campos e clique em **Salvar alterações**; **Cancelar edição** volta ao modo de cadastro.
 
 ### Endpoints
 
@@ -118,3 +116,54 @@ docker compose logs -f app | grep -E '"operation":"(create|update|get|insert|sel
 ### Testes
 
 Os testes unitários de `api.go` e `db.go` cobrem validação, autenticação, respostas 400/401/404/422/500 e as consultas SQL, e rodam com os mesmos comandos da seção de testes da issue #1. O teste de integração também cadastra, valida, edita e recarrega uma tarefa, conferindo os valores gravados no PostgreSQL.
+
+## Issue #3 — Listagem e exclusão de tarefas (Web)
+
+### Usar pela Web
+
+1. Inicie a aplicação com `docker compose up --build` e entre em <http://localhost:8080>.
+2. Após o login, a tabela **Tarefas** é carregada do banco automaticamente. Ela mostra 4 campos — **Título**, **Prioridade**, **Situação** e **Data de entrega** — com **5 tarefas por página**.
+3. Use **Anterior** e **Próxima** para navegar; o rodapé mostra a página atual, o total de páginas e o total de tarefas.
+4. Clique no nome de uma coluna para ordenar por ela; um novo clique inverte a ordem (▲ crescente, ▼ decrescente). Prioridade e situação seguem a ordem lógica (baixa → média → alta; pendente → em andamento → concluída), e o título ignora maiúsculas e minúsculas.
+5. Marque as tarefas desejadas (ou a caixa do cabeçalho para selecionar todas da página) e clique em **Excluir selecionadas**. Após a confirmação, as tarefas são removidas do banco e a tabela é recarregada. Se alguma não puder ser excluída (por exemplo, já removida em outra aba), a mensagem informa qual.
+
+Cadastrar ou editar uma tarefa também recarrega a tabela.
+
+### Endpoints
+
+Ambos exigem a sessão obtida em `POST /api/web/login` e retornam **HTTP 401** sem sessão válida.
+
+| Método e rota | Função | Respostas |
+|---|---|---|
+| `GET /api/web/records` | Lista uma página de tarefas | 200 com a página; 400 parâmetro inválido |
+| `DELETE /api/web/records/{id}` | Exclui uma tarefa | 204 sem corpo; 404 tarefa inexistente |
+
+Parâmetros opcionais de `GET /api/web/records` (query string):
+
+| Parâmetro | Valores | Padrão |
+|---|---|---|
+| `page` | inteiro de 1 a 100000 | `1` |
+| `sort` | `id`, `title`, `priority`, `status`, `due_date` | `id` |
+| `order` | `asc`, `desc` | `asc` |
+
+O tamanho da página é fixo em 5. Exemplo de resposta:
+
+```json
+{"items":[{"id":8,"title":"Estudar Git","description":"","priority":"high","status":"in_progress","due_date":"2026-11-18","category":"estudos"}],"page":1,"page_size":5,"total":7,"total_pages":2}
+```
+
+Uma página além da última retorna `items` vazio; a Web volta automaticamente para a última página existente (por exemplo, depois de excluir todas as tarefas da última página).
+
+### Logs
+
+A listagem gera `operation: "list"` na API e `operation: "select"` no banco; a exclusão gera `operation: "delete"` nas duas camadas, sempre com o mesmo `request_id`. Requisições sem sessão ou com parâmetros inválidos geram somente o log da API, com `status: "error"`. Para acompanhar:
+
+```bash
+docker compose logs -f app | grep -E '"operation":"(list|select|delete)"'
+```
+
+### Testes
+
+Os testes unitários cobrem a leitura e a validação dos parâmetros, as respostas 200/204/400/401/404/500, a ordenação de cada coluna, a paginação e as falhas do banco, e rodam com os mesmos comandos da seção de testes da issue #1. O teste de integração cria tarefas suficientes para duas páginas, confere 5 itens na primeira página e a ordenação por título, exclui uma tarefa, confirma o 404 ao repetir a exclusão e verifica no PostgreSQL que o registro foi removido.
+
+Em clones no Windows com `core.autocrlf=true`, o arquivo `.gitattributes` mantém os scripts `.sh` com quebras de linha LF, para que `tools/coverage.sh` rode no contêiner Linux.
