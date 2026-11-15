@@ -51,6 +51,7 @@ type taskStore interface {
 	createCLITask(context.Context, task, string) (task, error)
 	updateCLITask(context.Context, int64, task, string) (task, error)
 	listCLITasks(context.Context, cliPageQuery, string) (taskPage, error)
+	searchCLITasks(context.Context, cliSearchQuery, string) (taskPage, error)
 	deleteCLITask(context.Context, int64, string) error
 }
 
@@ -94,6 +95,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/api/cli/records":
 		operation = "list"
 		status = s.listCLIRecords(w, r, id)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/cli/records/search":
+		operation = "search"
+		status = s.searchCLIRecords(w, r, id)
 	case r.Method == http.MethodDelete && cliRecordID(r.URL.Path) > 0:
 		operation = "delete"
 		status = s.deleteCLIRecord(w, r, id, cliRecordID(r.URL.Path))
@@ -365,6 +369,24 @@ func (s *server) listCLIRecords(w http.ResponseWriter, r *http.Request, requestI
 		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
 	}
 	return writeJSON(w, http.StatusOK, page)
+}
+
+// searchCLIRecords filters tasks through the CLI's own authenticated endpoint.
+func (s *server) searchCLIRecords(w http.ResponseWriter, r *http.Request, requestID string) int {
+	if _, ok := s.currentCLIUser(r); !ok {
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+	}
+	values := r.URL.Query()
+	page, pageOK := parseCLIPageQuery(values)
+	title, priority, status, filtersOK := parseTaskFilters(values)
+	if !pageOK || !filtersOK {
+		return writeError(w, http.StatusBadRequest, "Invalid search parameters")
+	}
+	result, err := s.tasks.searchCLITasks(r.Context(), cliSearchQuery{cliPageQuery: page, Title: title, Priority: priority, Status: status}, requestID)
+	if err != nil {
+		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
+	}
+	return writeJSON(w, http.StatusOK, result)
 }
 
 // deleteCLIRecord deletes one task by id for a CLI holding a valid Bearer token.
