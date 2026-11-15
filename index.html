@@ -19,9 +19,21 @@
     .inline button { width: auto; margin-bottom: 0; }
     .secondary { background: #eee; border: 1px solid #ccc; }
     #task-message { color: #060; }
-    #saved li { margin: .3rem 0; }
-    #saved button { display: inline; width: auto; margin: 0 0 0 .5rem; padding: .2rem .6rem; }
     fieldset { border: 1px solid #ddd; padding: 1rem; margin: 0 0 1.5rem; }
+    /* Keep the hidden attribute effective on elements styled with display above. */
+    [hidden] { display: none !important; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; margin: .5rem 0 1rem; }
+    th, td { border-bottom: 1px solid #ddd; padding: .45rem .4rem; text-align: left; vertical-align: middle; }
+    th button.sort { display: inline; width: auto; margin: 0; padding: 0; border: 0; background: none; font-weight: bold; cursor: pointer; }
+    td button, .pager button, #delete-selected { display: inline-block; width: auto; margin: 0; padding: .3rem .7rem; }
+    input[type="checkbox"] { display: inline; width: auto; margin: 0; }
+    tr.selected { background: #fff7d6; }
+    .pager { display: flex; gap: .7rem; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-bottom: 1rem; }
+    .danger { background: #a00; color: #fff; border: 1px solid #800; }
+    .danger:disabled { opacity: .5; }
+    #list-message { color: #060; }
+    #list-error { color: #a00; }
   </style>
 </head>
 <body>
@@ -100,8 +112,30 @@
         <p id="task-message" role="status"></p>
       </form>
 
-      <h3>Salvas nesta sessão</h3>
-      <ul id="saved"></ul>
+      <h2>Tarefas</h2>
+      <p id="list-error" role="alert"></p>
+      <p id="list-message" role="status"></p>
+      <div class="table-wrap">
+        <table id="task-table">
+          <thead>
+            <tr>
+              <th><input type="checkbox" id="select-all" aria-label="Selecionar todas as tarefas da página"></th>
+              <th data-sort="title"><button type="button" class="sort" data-sort="title">Título</button></th>
+              <th data-sort="priority"><button type="button" class="sort" data-sort="priority">Prioridade</button></th>
+              <th data-sort="status"><button type="button" class="sort" data-sort="status">Situação</button></th>
+              <th data-sort="due_date"><button type="button" class="sort" data-sort="due_date">Data de entrega</button></th>
+              <th>Ações</th>
+            </tr>
+          </thead>
+          <tbody id="task-rows"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button type="button" id="prev-page">Anterior</button>
+        <span id="page-info"></span>
+        <button type="button" id="next-page">Próxima</button>
+      </div>
+      <button type="button" id="delete-selected" class="danger" disabled>Excluir selecionadas</button>
     </section>
   </main>
   <script>
@@ -113,7 +147,13 @@
     const taskError = document.getElementById('task-error');
     const taskMessage = document.getElementById('task-message');
     const fields = ['title', 'description', 'priority', 'status', 'due_date', 'category'];
-    const saved = new Map();
+    const listError = document.getElementById('list-error');
+    const listMessage = document.getElementById('list-message');
+    const priorityLabels = { low: 'Baixa', medium: 'Média', high: 'Alta' };
+    const statusLabels = { pending: 'Pendente', in_progress: 'Em andamento', done: 'Concluída' };
+    // Listing state: current page, ordering and the ids selected on this page.
+    const listState = { page: 1, sort: 'id', order: 'asc', totalPages: 0 };
+    const selected = new Set();
     let editingId = null;
 
     async function showSession() {
@@ -124,6 +164,7 @@
       welcome.hidden = false;
       form.hidden = true;
       tasksSection.hidden = false;
+      await loadList();
     }
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
@@ -175,19 +216,106 @@
       showProblems({});
       setMode(null);
     }
-    function remember(task) {
-      saved.set(task.id, task);
-      const list = document.getElementById('saved');
-      list.replaceChildren(...[...saved.values()].map((item) => {
-        const li = document.createElement('li');
-        li.textContent = `#${item.id} — ${item.title} (${item.category}, ${item.due_date})`;
+    function formatDate(value) {
+      const [year, month, day] = value.split('-');
+      return `${day}/${month}/${year}`;
+    }
+    function cell(text) {
+      const td = document.createElement('td');
+      td.textContent = text;
+      return td;
+    }
+    function updateSelectionControls() {
+      const boxes = [...document.querySelectorAll('#task-rows input[type="checkbox"]')];
+      document.getElementById('select-all').checked = boxes.length > 0 && boxes.every((box) => box.checked);
+      const button = document.getElementById('delete-selected');
+      button.disabled = selected.size === 0;
+      button.textContent = selected.size ? `Excluir selecionadas (${selected.size})` : 'Excluir selecionadas';
+    }
+    function renderList(page) {
+      selected.clear();
+      listState.totalPages = page.total_pages;
+      const rows = page.items.map((item) => {
+        const tr = document.createElement('tr');
+        const check = document.createElement('input');
+        check.type = 'checkbox';
+        check.setAttribute('aria-label', `Selecionar tarefa #${item.id}`);
+        check.addEventListener('change', () => {
+          if (check.checked) selected.add(item.id); else selected.delete(item.id);
+          tr.classList.toggle('selected', check.checked);
+          updateSelectionControls();
+        });
+        const selectCell = document.createElement('td');
+        selectCell.append(check);
         const edit = document.createElement('button');
         edit.type = 'button';
         edit.textContent = 'Editar';
         edit.addEventListener('click', () => loadTask(item.id));
-        li.append(edit);
-        return li;
-      }));
+        const actions = document.createElement('td');
+        actions.append(edit);
+        tr.append(selectCell, cell(item.title), cell(priorityLabels[item.priority] || item.priority),
+          cell(statusLabels[item.status] || item.status), cell(formatDate(item.due_date)), actions);
+        return tr;
+      });
+      if (!rows.length) {
+        const tr = document.createElement('tr');
+        const td = cell('Nenhuma tarefa cadastrada.');
+        td.colSpan = 6;
+        tr.append(td);
+        rows.push(tr);
+      }
+      document.getElementById('task-rows').replaceChildren(...rows);
+      const pages = Math.max(page.total_pages, 1);
+      document.getElementById('page-info').textContent = `Página ${page.page} de ${pages} — ${page.total} tarefa(s)`;
+      document.getElementById('prev-page').disabled = page.page <= 1;
+      document.getElementById('next-page').disabled = page.page >= pages;
+      for (const th of document.querySelectorAll('th[data-sort]')) {
+        const active = th.dataset.sort === listState.sort;
+        th.setAttribute('aria-sort', active ? (listState.order === 'asc' ? 'ascending' : 'descending') : 'none');
+        const button = th.querySelector('button');
+        button.textContent = button.textContent.replace(/ [▲▼]$/, '') + (active ? (listState.order === 'asc' ? ' ▲' : ' ▼') : '');
+      }
+      updateSelectionControls();
+    }
+    // Loads the current page from the database through the web listing endpoint.
+    async function loadList() {
+      listError.textContent = '';
+      const params = new URLSearchParams({ page: listState.page, sort: listState.sort, order: listState.order });
+      try {
+        const response = await fetch(`/api/web/records?${params}`);
+        if (response.status === 401) { listError.textContent = 'Sessão expirada. Recarregue a página e entre novamente.'; return; }
+        if (!response.ok) { listError.textContent = 'Não foi possível carregar as tarefas.'; return; }
+        const page = await response.json();
+        // After deletions the current page may no longer exist: go to the last one.
+        if (!page.items.length && listState.page > 1 && page.total_pages > 0) {
+          listState.page = page.total_pages;
+          return loadList();
+        }
+        renderList(page);
+      } catch (_) { listError.textContent = 'Não foi possível conectar ao servidor.'; }
+    }
+    async function deleteSelected() {
+      const ids = [...selected];
+      if (!ids.length || !confirm(`Excluir ${ids.length} tarefa(s) selecionada(s)? Esta ação não pode ser desfeita.`)) return;
+      listError.textContent = '';
+      listMessage.textContent = '';
+      let deleted = 0;
+      const failed = [];
+      for (const id of ids) {
+        try {
+          const response = await fetch(`/api/web/records/${id}`, { method: 'DELETE' });
+          if (response.status === 401) { listError.textContent = 'Sessão expirada. Recarregue a página e entre novamente.'; return; }
+          if (response.ok) {
+            deleted++;
+            if (editingId === id) resetForm();
+          } else {
+            failed.push(response.status === 404 ? `#${id} (não encontrada)` : `#${id}`);
+          }
+        } catch (_) { failed.push(`#${id}`); }
+      }
+      if (deleted) listMessage.textContent = `${deleted} tarefa(s) excluída(s).`;
+      if (failed.length) listError.textContent = `Não foi possível excluir: ${failed.join(', ')}.`;
+      await loadList();
     }
     async function loadTask(id) {
       taskError.textContent = '';
@@ -233,11 +361,33 @@
         if (response.status === 404) { taskError.textContent = 'A tarefa não existe mais.'; return; }
         if (!response.ok) { taskError.textContent = 'Não foi possível salvar a tarefa.'; return; }
         const result = await response.json();
-        remember(result);
         taskMessage.textContent = editingId ? `Tarefa #${result.id} atualizada.` : `Tarefa #${result.id} cadastrada.`;
         resetForm();
+        await loadList();
       } catch (_) { taskError.textContent = 'Não foi possível conectar ao servidor.'; }
     });
+
+    for (const button of document.querySelectorAll('button.sort')) {
+      button.addEventListener('click', () => {
+        const column = button.dataset.sort;
+        listState.order = listState.sort === column && listState.order === 'asc' ? 'desc' : 'asc';
+        listState.sort = column;
+        listState.page = 1;
+        loadList();
+      });
+    }
+    document.getElementById('prev-page').addEventListener('click', () => {
+      if (listState.page > 1) { listState.page--; loadList(); }
+    });
+    document.getElementById('next-page').addEventListener('click', () => {
+      if (listState.page < listState.totalPages) { listState.page++; loadList(); }
+    });
+    document.getElementById('select-all').addEventListener('change', (event) => {
+      for (const box of document.querySelectorAll('#task-rows input[type="checkbox"]')) {
+        if (box.checked !== event.target.checked) { box.checked = event.target.checked; box.dispatchEvent(new Event('change')); }
+      }
+    });
+    document.getElementById('delete-selected').addEventListener('click', deleteSelected);
 
     showSession().catch(() => { error.textContent = 'Não foi possível conectar ao servidor.'; });
   </script>
