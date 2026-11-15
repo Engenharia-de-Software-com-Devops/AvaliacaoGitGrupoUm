@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -257,5 +258,80 @@ func TestListAndDeleteCommands(t *testing.T) {
 				t.Fatal("token printed")
 			}
 		})
+	}
+}
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, errors.New("connection reset") }
+
+func TestExportCommand(t *testing.T) {
+	csvBody := "id,title,description,priority,status,due_date,category\n7,Write report,,high,pending,2026-11-20,work\n"
+	dir := t.TempDir()
+	token := map[string]string{"TODO_TOKEN": "cli-secret-token"}
+	filters := []string{"export", "--title", "report", "--priority", "high", "--status", "pending", "--sort", "due_date", "--order", "desc"}
+	for _, tc := range []struct {
+		name       string
+		args       []string
+		env        map[string]string
+		status     int
+		body       io.Reader
+		failure    bool
+		wantQuery  string
+		wantCode   int
+		wantStdout string
+		wantStderr string
+		wantFile   string
+	}{
+		{name: "to standard output", args: filters, env: token, status: 200, body: strings.NewReader(csvBody),
+			wantQuery: "order=desc&priority=high&sort=due_date&status=pending&title=report", wantStdout: csvBody},
+		{name: "defaults without filters", args: []string{"export"}, env: token, status: 200, body: strings.NewReader(csvBody),
+			wantQuery: "order=asc&priority=&sort=id&status=&title=", wantStdout: csvBody},
+		{name: "to a file", args: []string{"export", "--output", filepath.Join(dir, "tarefas.csv")}, env: token, status: 200, body: strings.NewReader(csvBody),
+			wantStdout: "CSV saved to " + filepath.Join(dir, "tarefas.csv") + ".\n", wantFile: filepath.Join(dir, "tarefas.csv")},
+		{name: "file cannot be created", args: []string{"export", "--output", filepath.Join(dir, "missing", "tarefas.csv")}, env: token, status: 200, body: strings.NewReader(csvBody),
+			wantCode: 1, wantStderr: "Could not create"},
+		{name: "download fails while writing a file", args: []string{"export", "--output", filepath.Join(dir, "partial.csv")}, env: token, status: 200, body: failingReader{},
+			wantCode: 1, wantStderr: "Could not write the CSV."},
+		{name: "download fails while writing standard output", args: []string{"export"}, env: token, status: 200, body: failingReader{},
+			wantCode: 1, wantStderr: "Could not write the CSV."},
+		{name: "missing token", args: []string{"export"}, wantCode: 2, wantStderr: "Set TODO_TOKEN."},
+		{name: "unknown flag", args: []string{"export", "--page", "2"}, env: token, wantCode: 2, wantStderr: "Usage:"},
+		{name: "extra argument", args: []string{"export", "extra"}, env: token, wantCode: 2, wantStderr: "Usage:"},
+		{name: "invalid options", args: []string{"export", "--priority", "urgent"}, env: token, status: 400, body: strings.NewReader("Invalid export parameters"), wantCode: 2, wantStderr: "Invalid export options"},
+		{name: "unauthorized", args: []string{"export"}, env: token, status: 401, body: strings.NewReader(""), wantCode: 1, wantStderr: "API returned HTTP 401."},
+		{name: "network failure", args: []string{"export"}, env: token, failure: true, wantCode: 1, wantStderr: "API connection failed."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+				if tc.failure {
+					return nil, errors.New("network failure")
+				}
+				if r.Method != http.MethodGet || r.URL.Host != "app:8080" || r.URL.Path != "/api/cli/records/export" || r.Header.Get("Authorization") != "Bearer cli-secret-token" {
+					t.Fatalf("request = %s %s %v", r.Method, r.URL, r.Header)
+				}
+				if tc.wantQuery != "" && r.URL.RawQuery != tc.wantQuery {
+					t.Fatalf("query = %s, want %s", r.URL.RawQuery, tc.wantQuery)
+				}
+				return &http.Response{StatusCode: tc.status, Body: io.NopCloser(tc.body), Header: make(http.Header)}, nil
+			})}
+			var stdout, stderr bytes.Buffer
+			code := run(tc.args, func(k string) string { return tc.env[k] }, client, &stdout, &stderr)
+			if code != tc.wantCode || stdout.String() != tc.wantStdout || !strings.Contains(stderr.String(), tc.wantStderr) {
+				t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
+			}
+			if tc.wantFile != "" {
+				content, err := os.ReadFile(tc.wantFile)
+				if err != nil || string(content) != csvBody {
+					t.Fatalf("file content = %q, %v", content, err)
+				}
+			}
+			if strings.Contains(stdout.String()+stderr.String(), "cli-secret-token") {
+				t.Fatal("token printed")
+			}
+		})
+	}
+	if _, err := os.Stat(filepath.Join(dir, "partial.csv")); !os.IsNotExist(err) {
+		t.Fatalf("partial export file was kept: %v", err)
 	}
 }
