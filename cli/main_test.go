@@ -335,3 +335,70 @@ func TestExportCommand(t *testing.T) {
 		t.Fatalf("partial export file was kept: %v", err)
 	}
 }
+
+func TestDashboardCommand(t *testing.T) {
+	token := map[string]string{"TODO_TOKEN": "cli-secret-token"}
+	indicators := `{"total":3,"by_status":[{"key":"pending","count":2},{"key":"in_progress","count":0},{"key":"done","count":1}],` +
+		`"by_priority":[{"key":"low","count":1},{"key":"medium","count":0},{"key":"high","count":2}],"by_category":[{"key":"trabalho","count":3}]}`
+	empty := `{"total":0,"by_status":[{"key":"pending","count":0},{"key":"in_progress","count":0},{"key":"done","count":0}],` +
+		`"by_priority":[{"key":"low","count":0},{"key":"medium","count":0},{"key":"high","count":0}],"by_category":[]}`
+	for _, tc := range []struct {
+		name       string
+		args       []string
+		env        map[string]string
+		status     int
+		body       string
+		failure    bool
+		wantCode   int
+		wantLines  []string
+		wantStderr string
+	}{
+		{name: "indicators", args: []string{"dashboard"}, env: token, status: 200, body: indicators, wantLines: []string{
+			"Total: 3 tasks", "", "Tasks by status", "pending 2 67%", "in_progress 0 0%", "done 1 33%", "",
+			"Tasks by priority", "low 1 33%", "medium 0 0%", "high 2 67%", "", "Tasks by category", "trabalho 3 100%"}},
+		{name: "empty database", args: []string{"dashboard"}, env: token, status: 200, body: empty, wantLines: []string{
+			"Total: 0 tasks", "", "Tasks by status", "pending 0 0%", "in_progress 0 0%", "done 0 0%", "",
+			"Tasks by priority", "low 0 0%", "medium 0 0%", "high 0 0%", "", "Tasks by category", "(none)"}},
+		{name: "unauthorized", args: []string{"dashboard"}, env: token, status: 401, wantCode: 1, wantStderr: "API returned HTTP 401."},
+		{name: "invalid response", args: []string{"dashboard"}, env: token, status: 200, body: `{`, wantCode: 1, wantStderr: "Invalid API response."},
+		{name: "extra argument", args: []string{"dashboard", "extra"}, env: token, wantCode: 2, wantStderr: "Usage:"},
+		{name: "without token", args: []string{"dashboard"}, wantCode: 2, wantStderr: "Set TODO_TOKEN."},
+		{name: "network failure", args: []string{"dashboard"}, env: token, failure: true, wantCode: 1, wantStderr: "API connection failed."},
+		{name: "bad URL", args: []string{"dashboard"}, env: map[string]string{"TODO_TOKEN": "cli-secret-token", "TODO_API_URL": "://bad"}, wantCode: 1, wantStderr: "Invalid API URL."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+				if tc.failure {
+					return nil, errors.New("network failure")
+				}
+				if r.Method != http.MethodGet || r.URL.Host != "app:8080" || r.URL.Path != "/api/cli/dashboard" || r.Header.Get("Authorization") != "Bearer cli-secret-token" {
+					t.Fatalf("request = %s %s %v", r.Method, r.URL, r.Header)
+				}
+				return &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body)), Header: make(http.Header)}, nil
+			})}
+			var stdout, stderr bytes.Buffer
+			code := run(tc.args, func(k string) string { return tc.env[k] }, client, &stdout, &stderr)
+			if code != tc.wantCode || !strings.Contains(stderr.String(), tc.wantStderr) {
+				t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
+			}
+			if tc.wantLines != nil {
+				lines := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
+				if len(lines) != len(tc.wantLines) {
+					t.Fatalf("stdout = %q", stdout.String())
+				}
+				for i, line := range lines {
+					if strings.Join(strings.Fields(line), " ") != tc.wantLines[i] {
+						t.Fatalf("line %d = %q, want %q", i, line, tc.wantLines[i])
+					}
+				}
+				// Counts and percentages are right-aligned in fixed columns.
+				if tc.name == "indicators" && lines[3] != "  pending          2   67%" {
+					t.Fatalf("unaligned output: %q", stdout.String())
+				}
+			}
+			if strings.Contains(stdout.String()+stderr.String(), "cli-secret-token") {
+				t.Fatal("token printed")
+			}
+		})
+	}
+}
