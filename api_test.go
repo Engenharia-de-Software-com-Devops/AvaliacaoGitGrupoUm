@@ -214,3 +214,21 @@ func TestDefaultStartRequiresConfiguration(t *testing.T) {
 		t.Fatal("startup without configuration succeeded")
 	}
 }
+
+func TestValidateTask(t *testing.T) {
+	if problems := validateTask(normalizeTask(task{Title: "  Write report ", Priority: "high", Status: "done", DueDate: "2026-11-20", Category: " work "})); len(problems) != 0 {
+		t.Fatalf("valid task rejected: %v", problems)
+	}
+	problems := validateTask(task{Title: "ab", Description: strings.Repeat("d", 501), Priority: "urgent", Status: "later", DueDate: "20/11/2026", Category: "x"})
+	for _, field := range []string{"title", "description", "priority", "status", "due_date", "category"} {
+		if problems[field] == "" {
+			t.Errorf("missing validation error for %s", field)
+		}
+	}
+	if problems := validateTask(task{Title: strings.Repeat("é", 100), Priority: "low", Status: "pending", DueDate: "2026-02-28", Category: strings.Repeat("ç", 50)}); len(problems) != 0 {
+		t.Fatalf("multibyte limits rejected: %v", problems)
+	}
+	if problems := validateTask(task{Title: strings.Repeat("t", 101), Priority: "low", Status: "pending", DueDate: "2026-02-30", Category: strings.Repeat("c", 51)}); len(problems) != 3 {
+		t.Fatalf("upper limits and impossible date: %v", problems)
+	}
+}

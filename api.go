@@ -13,9 +13,11 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -169,4 +171,42 @@ func main() {
 		logEvent(os.Stdout, "api", "startup", "error", "startup", "Application could not start")
 		exit(1)
 	}
+}
+
+var taskPriorities = map[string]bool{"low": true, "medium": true, "high": true}
+var taskStatuses = map[string]bool{"pending": true, "in_progress": true, "done": true}
+
+// normalizeTask trims surrounding whitespace from every text field.
+func normalizeTask(input task) task {
+	input.Title = strings.TrimSpace(input.Title)
+	input.Description = strings.TrimSpace(input.Description)
+	input.Priority = strings.TrimSpace(input.Priority)
+	input.Status = strings.TrimSpace(input.Status)
+	input.DueDate = strings.TrimSpace(input.DueDate)
+	input.Category = strings.TrimSpace(input.Category)
+	return input
+}
+
+// validateTask returns one user-facing message per invalid field.
+func validateTask(input task) map[string]string {
+	problems := map[string]string{}
+	if length := utf8.RuneCountInString(input.Title); length < 3 || length > 100 {
+		problems["title"] = "Informe um título com 3 a 100 caracteres."
+	}
+	if utf8.RuneCountInString(input.Description) > 500 {
+		problems["description"] = "A descrição deve ter no máximo 500 caracteres."
+	}
+	if !taskPriorities[input.Priority] {
+		problems["priority"] = "Escolha a prioridade: baixa, média ou alta."
+	}
+	if !taskStatuses[input.Status] {
+		problems["status"] = "Escolha a situação: pendente, em andamento ou concluída."
+	}
+	if _, err := time.Parse(time.DateOnly, input.DueDate); err != nil {
+		problems["due_date"] = "Informe uma data de entrega válida (AAAA-MM-DD)."
+	}
+	if length := utf8.RuneCountInString(input.Category); length < 2 || length > 50 {
+		problems["category"] = "Informe uma categoria com 2 a 50 caracteres."
+	}
+	return problems
 }
