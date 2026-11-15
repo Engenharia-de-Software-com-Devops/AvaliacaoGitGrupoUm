@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -230,5 +231,133 @@ func TestValidateTask(t *testing.T) {
 	}
 	if problems := validateTask(task{Title: strings.Repeat("t", 101), Priority: "low", Status: "pending", DueDate: "2026-02-30", Category: strings.Repeat("c", 51)}); len(problems) != 3 {
 		t.Fatalf("upper limits and impossible date: %v", problems)
+	}
+}
+
+type fakeTasks struct {
+	saved     task
+	id        int64
+	err       error
+	requestID string
+	calls     int
+}
+
+func (f *fakeTasks) record(id int64, input task, requestID string) (task, error) {
+	f.calls++
+	f.id, f.saved, f.requestID = id, input, requestID
+	if f.err != nil {
+		return task{}, f.err
+	}
+	input.ID = id
+	if id == 0 {
+		input.ID = 42
+	}
+	return input, nil
+}
+
+func (f *fakeTasks) createWebTask(_ context.Context, input task, requestID string) (task, error) {
+	return f.record(0, input, requestID)
+}
+
+func (f *fakeTasks) updateWebTask(_ context.Context, id int64, input task, requestID string) (task, error) {
+	return f.record(id, input, requestID)
+}
+
+func (f *fakeTasks) getWebTask(_ context.Context, id int64, requestID string) (task, error) {
+	return f.record(id, sampleTask, requestID)
+}
+
+func taskServer(store *fakeTasks) (*server, *bytes.Buffer) {
+	var logs bytes.Buffer
+	server := newServer(&fakeAuth{}, &logs, strings.NewReader(""), false)
+	server.tasks = store
+	server.sessions["valid"] = session{username: "alice", expires: time.Now().Add(time.Hour)}
+	return server, &logs
+}
+
+func taskRequest(method, path, body string, authenticated bool) *http.Request {
+	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	if authenticated {
+		request.AddCookie(&http.Cookie{Name: "session", Value: "valid"})
+	}
+	return request
+}
+
+const validTaskJSON = `{"title":" Write report ","description":"Quarterly numbers","priority":"high","status":"pending","due_date":"2026-11-20","category":"work"}`
+
+func TestWebTaskEndpoints(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path, operation string
+		wantID                        int64
+		wantStatus                    int
+	}{
+		{name: "create", method: http.MethodPost, path: "/api/web/records", operation: "create", wantID: 42, wantStatus: http.StatusCreated},
+		{name: "update", method: http.MethodPut, path: "/api/web/records/7", operation: "update", wantID: 7, wantStatus: http.StatusOK},
+		{name: "get", method: http.MethodGet, path: "/api/web/records/7", operation: "get", wantID: 7, wantStatus: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{}
+			server, logs := taskServer(store)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, taskRequest(tc.method, tc.path, validTaskJSON, true))
+			if response.Code != tc.wantStatus || response.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("status = %d, body %s", response.Code, response.Body.String())
+			}
+			var got task
+			if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil || got.ID != tc.wantID || got.Title != "Write report" {
+				t.Fatalf("response task = %+v, %v", got, err)
+			}
+			if tc.method != http.MethodGet && store.saved.Title != "Write report" {
+				t.Fatalf("payload was not normalized: %+v", store.saved)
+			}
+			want := `"layer":"api","client":"web","operation":"` + tc.operation + `","status":"success","request_id":"` + store.requestID + `"`
+			if store.requestID == "" || !strings.Contains(logs.String(), want) {
+				t.Fatalf("API log not correlated: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestWebTaskEndpointFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path, body string
+		authenticated            bool
+		storeErr                 error
+		want                     int
+		wantErrors               bool
+	}{
+		{name: "create without session", method: http.MethodPost, path: "/api/web/records", body: validTaskJSON, want: http.StatusUnauthorized},
+		{name: "update without session", method: http.MethodPut, path: "/api/web/records/7", body: validTaskJSON, want: http.StatusUnauthorized},
+		{name: "get without session", method: http.MethodGet, path: "/api/web/records/7", want: http.StatusUnauthorized},
+		{name: "invalid JSON", method: http.MethodPost, path: "/api/web/records", body: "{", authenticated: true, want: http.StatusBadRequest},
+		{name: "unknown field", method: http.MethodPost, path: "/api/web/records", body: `{"owner":"bob"}`, authenticated: true, want: http.StatusBadRequest},
+		{name: "validation errors", method: http.MethodPost, path: "/api/web/records", body: `{"title":"ab"}`, authenticated: true, want: http.StatusUnprocessableEntity, wantErrors: true},
+		{name: "update missing task", method: http.MethodPut, path: "/api/web/records/7", body: validTaskJSON, authenticated: true, storeErr: errTaskNotFound, want: http.StatusNotFound},
+		{name: "get missing task", method: http.MethodGet, path: "/api/web/records/7", authenticated: true, storeErr: errTaskNotFound, want: http.StatusNotFound},
+		{name: "storage failure", method: http.MethodPost, path: "/api/web/records", body: validTaskJSON, authenticated: true, storeErr: errors.New("database down"), want: http.StatusInternalServerError},
+		{name: "non numeric id", method: http.MethodPut, path: "/api/web/records/abc", body: validTaskJSON, authenticated: true, want: http.StatusNotFound},
+		{name: "zero id", method: http.MethodGet, path: "/api/web/records/0", authenticated: true, want: http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{err: tc.storeErr}
+			server, logs := taskServer(store)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, taskRequest(tc.method, tc.path, tc.body, tc.authenticated))
+			if response.Code != tc.want {
+				t.Fatalf("status = %d, want %d (%s)", response.Code, tc.want, response.Body.String())
+			}
+			if (tc.storeErr == nil) != (store.calls == 0) {
+				t.Fatalf("store calls = %d", store.calls)
+			}
+			if tc.wantErrors {
+				var body struct{ Errors map[string]string }
+				if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || len(body.Errors) != 5 {
+					t.Fatalf("validation body = %s", response.Body.String())
+				}
+			}
+			if !strings.Contains(logs.String(), `"layer":"api","client":"web"`) || !strings.Contains(logs.String(), `"status":"error"`) {
+				t.Fatalf("failure not logged: %s", logs.String())
+			}
+		})
 	}
 }
