@@ -149,6 +149,7 @@ func TestRun(t *testing.T) {
 				} else {
 					create.WillReturnResult(sqlmock.NewResult(0, 0))
 					mock.ExpectExec("INSERT INTO users").WithArgs("alice", sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
+					mock.ExpectExec("CREATE TABLE IF NOT EXISTS tasks").WillReturnResult(sqlmock.NewResult(0, 0))
 				}
 				mock.ExpectClose()
 			}

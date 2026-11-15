@@ -19,6 +19,7 @@ func TestDatabaseBootstrap(t *testing.T) {
 		{name: "success"},
 		{name: "create fails", fail: "create"},
 		{name: "insert fails", fail: "insert"},
+		{name: "tasks table fails", fail: "tasks"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			conn, mock, err := sqlmock.New()
@@ -38,6 +39,14 @@ func TestDatabaseBootstrap(t *testing.T) {
 					insert.WillReturnError(errors.New("db failure"))
 				} else {
 					insert.WillReturnResult(sqlmock.NewResult(0, 1))
+				}
+			}
+			if tc.fail == "" || tc.fail == "tasks" {
+				tasks := mock.ExpectExec("CREATE TABLE IF NOT EXISTS tasks")
+				if tc.fail == "tasks" {
+					tasks.WillReturnError(errors.New("db failure"))
+				} else {
+					tasks.WillReturnResult(sqlmock.NewResult(0, 0))
 				}
 			}
 			var logs bytes.Buffer
