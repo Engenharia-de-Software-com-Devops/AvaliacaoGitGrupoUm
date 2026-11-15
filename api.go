@@ -50,6 +50,8 @@ type taskStore interface {
 	webDashboard(context.Context, string) (dashboard, error)
 	createCLITask(context.Context, task, string) (task, error)
 	updateCLITask(context.Context, int64, task, string) (task, error)
+	listCLITasks(context.Context, cliPageQuery, string) (taskPage, error)
+	deleteCLITask(context.Context, int64, string) error
 }
 
 type server struct {
@@ -89,6 +91,12 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPut && cliRecordID(r.URL.Path) > 0:
 		operation = "update"
 		status = s.saveCLITask(w, r, id, cliRecordID(r.URL.Path))
+	case r.Method == http.MethodGet && r.URL.Path == "/api/cli/records":
+		operation = "list"
+		status = s.listCLIRecords(w, r, id)
+	case r.Method == http.MethodDelete && cliRecordID(r.URL.Path) > 0:
+		operation = "delete"
+		status = s.deleteCLIRecord(w, r, id, cliRecordID(r.URL.Path))
 	case r.Method == http.MethodGet && r.URL.Path == "/api/web/health":
 		operation, status = "health", http.StatusOK
 	case r.Method == http.MethodPost && r.URL.Path == "/api/web/login":
@@ -301,6 +309,78 @@ func webRecordID(path string) int64 {
 // cliRecordID extracts a positive task id from /api/cli/records/{id}, or returns 0.
 func cliRecordID(path string) int64 {
 	return recordID("/api/cli/records/", path)
+}
+
+const (
+	defaultCLIPageSize = 10
+	maxCLIPageSize     = 100
+)
+
+// parseCLIPageQuery reads page, page_size, sort and order for the CLI listing,
+// defaulting to the first page of ten tasks ordered by id ascending. It reports
+// false for any value outside the accepted set.
+func parseCLIPageQuery(values url.Values) (cliPageQuery, bool) {
+	query := cliPageQuery{Page: 1, PageSize: defaultCLIPageSize, Sort: "id", Order: "asc"}
+	for name, limit := range map[string]int{"page": maxWebPage, "page_size": maxCLIPageSize} {
+		value := values.Get(name)
+		if value == "" {
+			continue
+		}
+		number, err := strconv.Atoi(value)
+		if err != nil || number < 1 || number > limit {
+			return query, false
+		}
+		if name == "page" {
+			query.Page = number
+		} else {
+			query.PageSize = number
+		}
+	}
+	if value := values.Get("sort"); value != "" {
+		if _, ok := cliTaskSortColumns[value]; !ok {
+			return query, false
+		}
+		query.Sort = value
+	}
+	if value := values.Get("order"); value != "" {
+		if value != "asc" && value != "desc" {
+			return query, false
+		}
+		query.Order = value
+	}
+	return query, true
+}
+
+// listCLIRecords answers one page of tasks to a CLI holding a valid Bearer token.
+func (s *server) listCLIRecords(w http.ResponseWriter, r *http.Request, requestID string) int {
+	if _, ok := s.currentCLIUser(r); !ok {
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+	}
+	query, ok := parseCLIPageQuery(r.URL.Query())
+	if !ok {
+		return writeError(w, http.StatusBadRequest, "Invalid listing parameters")
+	}
+	page, err := s.tasks.listCLITasks(r.Context(), query, requestID)
+	if err != nil {
+		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
+	}
+	return writeJSON(w, http.StatusOK, page)
+}
+
+// deleteCLIRecord deletes one task by id for a CLI holding a valid Bearer token.
+func (s *server) deleteCLIRecord(w http.ResponseWriter, r *http.Request, requestID string, id int64) int {
+	if _, ok := s.currentCLIUser(r); !ok {
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+	}
+	err := s.tasks.deleteCLITask(r.Context(), id, requestID)
+	if errors.Is(err, errTaskNotFound) {
+		return writeError(w, http.StatusNotFound, "Task not found")
+	}
+	if err != nil {
+		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return http.StatusNoContent
 }
 
 // saveCLITask creates (id 0) or replaces a task for the CLI. It accepts only a

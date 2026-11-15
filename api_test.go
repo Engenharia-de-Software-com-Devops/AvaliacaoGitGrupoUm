@@ -337,6 +337,7 @@ type fakeTasks struct {
 	query     taskPageQuery
 	search    taskSearchQuery
 	export    taskExportQuery
+	cliQuery  cliPageQuery
 	exported  []task
 	id        int64
 	err       error
@@ -892,5 +893,133 @@ func TestCLITokenDoesNotAuthorizeWebEndpoints(t *testing.T) {
 	server.ServeHTTP(response, cliTaskRequest(http.MethodPost, "/api/web/records", validTaskJSON, "cli-valid"))
 	if response.Code != http.StatusUnauthorized || store.calls != 0 {
 		t.Fatalf("web endpoint accepted a CLI token: %d", response.Code)
+	}
+}
+
+func (f *fakeTasks) listCLITasks(_ context.Context, query cliPageQuery, requestID string) (taskPage, error) {
+	f.calls++
+	f.cliQuery, f.requestID = query, requestID
+	if f.err != nil {
+		return taskPage{}, f.err
+	}
+	stored := sampleTask
+	stored.ID = 7
+	return taskPage{Items: []task{stored}, Page: query.Page, PageSize: query.PageSize, Total: 12, TotalPages: 2}, nil
+}
+
+func (f *fakeTasks) deleteCLITask(_ context.Context, id int64, requestID string) error {
+	f.calls++
+	f.id, f.requestID = id, requestID
+	return f.err
+}
+
+func TestCLITaskList(t *testing.T) {
+	for _, tc := range []struct {
+		name, query string
+		want        cliPageQuery
+	}{
+		{name: "defaults", want: cliPageQuery{Page: 1, PageSize: 10, Sort: "id", Order: "asc"}},
+		{name: "every option", query: "?page=2&page_size=3&sort=due_date&order=desc", want: cliPageQuery{Page: 2, PageSize: 3, Sort: "due_date", Order: "desc"}},
+		{name: "title", query: "?sort=title&page_size=100", want: cliPageQuery{Page: 1, PageSize: 100, Sort: "title", Order: "asc"}},
+		{name: "priority", query: "?sort=priority&order=asc", want: cliPageQuery{Page: 1, PageSize: 10, Sort: "priority", Order: "asc"}},
+		{name: "status", query: "?sort=status&page=100000", want: cliPageQuery{Page: 100000, PageSize: 10, Sort: "status", Order: "asc"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{}
+			server, logs := cliTaskServer(store)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, cliTaskRequest(http.MethodGet, "/api/cli/records"+tc.query, "", "cli-valid"))
+			if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("status = %d, body %s", response.Code, response.Body.String())
+			}
+			if store.cliQuery != tc.want {
+				t.Fatalf("query = %+v, want %+v", store.cliQuery, tc.want)
+			}
+			var page taskPage
+			if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil || len(page.Items) != 1 || page.Items[0].ID != 7 || page.PageSize != tc.want.PageSize || page.Total != 12 {
+				t.Fatalf("page = %+v, %v", page, err)
+			}
+			want := `"layer":"api","client":"cli","operation":"list","status":"success","request_id":"` + store.requestID + `"`
+			if store.requestID == "" || !strings.Contains(logs.String(), want) || strings.Contains(logs.String(), "cli-valid") {
+				t.Fatalf("API log not correlated or unsafe: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestCLITaskDelete(t *testing.T) {
+	store := &fakeTasks{}
+	server, logs := cliTaskServer(store)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, cliTaskRequest(http.MethodDelete, "/api/cli/records/7", "", "cli-valid"))
+	if response.Code != http.StatusNoContent || response.Body.Len() != 0 || store.id != 7 {
+		t.Fatalf("status = %d, id = %d, body %s", response.Code, store.id, response.Body.String())
+	}
+	want := `"layer":"api","client":"cli","operation":"delete","status":"success","request_id":"` + store.requestID + `"`
+	if store.requestID == "" || !strings.Contains(logs.String(), want) {
+		t.Fatalf("API log not correlated: %s", logs.String())
+	}
+}
+
+func TestCLITaskListAndDeleteFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path, token string
+		webCookie                 bool
+		storeErr                  error
+		want                      int
+	}{
+		{name: "list without token", method: http.MethodGet, path: "/api/cli/records", want: http.StatusUnauthorized},
+		{name: "delete without token", method: http.MethodDelete, path: "/api/cli/records/7", want: http.StatusUnauthorized},
+		{name: "list with invalid token", method: http.MethodGet, path: "/api/cli/records", token: "forged", want: http.StatusUnauthorized},
+		{name: "delete with expired token", method: http.MethodDelete, path: "/api/cli/records/7", token: "cli-expired", want: http.StatusUnauthorized},
+		{name: "web session is not a CLI token", method: http.MethodDelete, path: "/api/cli/records/7", webCookie: true, want: http.StatusUnauthorized},
+		{name: "page zero", method: http.MethodGet, path: "/api/cli/records?page=0", token: "cli-valid", want: http.StatusBadRequest},
+		{name: "page not numeric", method: http.MethodGet, path: "/api/cli/records?page=abc", token: "cli-valid", want: http.StatusBadRequest},
+		{name: "page too large", method: http.MethodGet, path: "/api/cli/records?page=100001", token: "cli-valid", want: http.StatusBadRequest},
+		{name: "page size zero", method: http.MethodGet, path: "/api/cli/records?page_size=0", token: "cli-valid", want: http.StatusBadRequest},
+		{name: "page size too large", method: http.MethodGet, path: "/api/cli/records?page_size=101", token: "cli-valid", want: http.StatusBadRequest},
+		{name: "page size not numeric", method: http.MethodGet, path: "/api/cli/records?page_size=ten", token: "cli-valid", want: http.StatusBadRequest},
+		{name: "unknown sort", method: http.MethodGet, path: "/api/cli/records?sort=category", token: "cli-valid", want: http.StatusBadRequest},
+		{name: "unknown order", method: http.MethodGet, path: "/api/cli/records?order=up", token: "cli-valid", want: http.StatusBadRequest},
+		{name: "list storage failure", method: http.MethodGet, path: "/api/cli/records", token: "cli-valid", storeErr: errors.New("database down"), want: http.StatusInternalServerError},
+		{name: "delete missing task", method: http.MethodDelete, path: "/api/cli/records/7", token: "cli-valid", storeErr: errTaskNotFound, want: http.StatusNotFound},
+		{name: "delete storage failure", method: http.MethodDelete, path: "/api/cli/records/7", token: "cli-valid", storeErr: errors.New("database down"), want: http.StatusInternalServerError},
+		{name: "delete invalid id", method: http.MethodDelete, path: "/api/cli/records/abc", token: "cli-valid", want: http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{err: tc.storeErr}
+			server, logs := cliTaskServer(store)
+			request := cliTaskRequest(tc.method, tc.path, "", tc.token)
+			if tc.webCookie {
+				request.AddCookie(&http.Cookie{Name: "session", Value: "valid"})
+			}
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, request)
+			if response.Code != tc.want {
+				t.Fatalf("status = %d, want %d (%s)", response.Code, tc.want, response.Body.String())
+			}
+			if (tc.storeErr == nil) != (store.calls == 0) {
+				t.Fatalf("store calls = %d", store.calls)
+			}
+			if !strings.Contains(logs.String(), `"layer":"api","client":"cli"`) || !strings.Contains(logs.String(), `"status":"error"`) {
+				t.Fatalf("failure not logged: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestCLITokenDoesNotAuthorizeWebListOrDelete(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodDelete} {
+		store := &fakeTasks{}
+		server, _ := cliTaskServer(store)
+		path := "/api/web/records"
+		if method == http.MethodDelete {
+			path += "/7"
+		}
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, cliTaskRequest(method, path, "", "cli-valid"))
+		if response.Code != http.StatusUnauthorized || store.calls != 0 {
+			t.Fatalf("%s %s accepted a CLI token: %d", method, path, response.Code)
+		}
 	}
 }
