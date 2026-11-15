@@ -482,3 +482,60 @@ docker compose logs -f app | grep '"operation":"search"'
 ```
 
 Os testes unitários, a cobertura de linhas e a integração com PostgreSQL usam os comandos da seção **Issue #1**. A integração compara resultados Web e CLI, filtros combinados, paginação, busca sem resultados, caracteres literais e rejeição de tokens ausentes ou inválidos.
+
+## Issue #11 — Exportação CSV (CLI)
+
+O comando `export` usa o token obtido na seção **Issue #7** (variável `TODO_TOKEN`), com a aplicação rodando via `docker compose up --build` em outro terminal. Ele exporta **todas** as tarefas que atendem aos filtros, sem paginação: não existem `--page` nem `--page-size`. Sem filtros, exporta todas as tarefas.
+
+### Gerar o arquivo e acessá-lo no host
+
+A CLI roda dentro de um contêiner. Para o arquivo ficar disponível no seu computador, grave-o na pasta `exports/`, que o serviço `cli` monta a partir de `./exports` na raiz do repositório:
+
+```bash
+docker compose --profile cli run --rm --no-deps cli export \
+  --title relatorio --priority high --status pending \
+  --sort due_date --order desc \
+  --output exports/tarefas.csv
+```
+
+A CLI responde `CSV saved to exports/tarefas.csv.`, e o arquivo fica em **`./exports/tarefas.csv`** no host, pronto para abrir no editor ou na planilha:
+
+```bash
+cat exports/tarefas.csv
+```
+
+O Docker cria a pasta `./exports` se ela não existir; ela não é versionada (`.gitignore`). Em hosts Linux, o arquivo pode pertencer ao usuário `root` do contêiner; use `sudo chown "$USER" exports/tarefas.csv` se precisar alterá-lo. Um caminho fora de `exports/` (por exemplo `--output /tmp/x.csv`) é gravado apenas dentro do contêiner e se perde ao final do comando.
+
+Também é possível omitir `--output`. Nesse caso o CSV sai na saída padrão e pode ser redirecionado diretamente para um arquivo do host. A opção `-T` desativa o pseudo-terminal, para o conteúdo não ser alterado:
+
+```bash
+docker compose --profile cli run --rm --no-deps -T cli export --status done > concluidas.csv
+```
+
+### Opções
+
+| Opção | Valores |
+|---|---|
+| `--title`, `--priority`, `--status` | Mesmos filtros da busca da issue #10, combinados com `AND` e todos opcionais |
+| `--sort`, `--order` | Mesma ordenação da listagem CLI (`id`, `title`, `priority`, `status`, `due_date`; `asc`/`desc`) |
+| `--output FILE` | Arquivo de destino; sem ela, o CSV vai para a saída padrão |
+
+Opções desconhecidas ou valores inválidos terminam com código 2; falhas da API, token inválido (HTTP 401) e erros de gravação terminam com código 1. O arquivo só é criado depois que a API aceita a requisição, e um arquivo incompleto é removido se o download falhar.
+
+### Formato e equivalência com a Web
+
+O conteúdo é **idêntico ao da exportação Web (#5)** para os mesmos filtros e ordenação: UTF-8, separado por vírgulas, com o cabeçalho `id,title,description,priority,status,due_date,category` e escape RFC 4180 de vírgulas, aspas e quebras de linha.
+
+### Endpoint
+
+`GET /api/cli/records/export` exige `Authorization: Bearer <token>`; o cookie da sessão Web não é aceito. Sem token válido, retorna **401**. Aceita `title`, `priority`, `status`, `sort` e `order`. Os parâmetros `page` e `page_size` são ignorados, e valores inválidos retornam **400**. A resposta usa `Content-Type: text/csv; charset=utf-8` e `Content-Disposition: attachment; filename="tarefas.csv"`. A consulta SQL é própria da CLI, parametrizada e sem `LIMIT`/`OFFSET`.
+
+### Logs e testes
+
+A exportação gera `operation: "export"` com `client: "cli"` na API e no banco, com o mesmo `request_id`. Requisições rejeitadas antes do banco geram somente o log da API. Token, filtros e conteúdo das tarefas não são registrados.
+
+```bash
+docker compose logs -f app | grep '"client":"cli"' | grep '"operation":"export"'
+```
+
+Os testes e a cobertura usam os comandos da seção **Issue #7**. Os testes unitários cobrem as opções e os códigos de saída do comando, a gravação na saída padrão e em arquivo, a remoção de arquivo incompleto, o endpoint (CSV exato, filtros, paginação ignorada, 400/401/500, cookie Web recusado) e a consulta SQL sem paginação. O teste de integração compara, com o PostgreSQL real, o CSV da CLI com o da Web: pelo endpoint com `page` e `page_size`, pela CLI na saída padrão, com `--output` e sem filtros.
