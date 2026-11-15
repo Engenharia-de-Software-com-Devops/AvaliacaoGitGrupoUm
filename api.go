@@ -272,16 +272,28 @@ func (s *server) listTasks(w http.ResponseWriter, r *http.Request, requestID str
 	return writeJSON(w, http.StatusOK, page)
 }
 
+// parseTaskFilters reads the title, priority and status filters shared by the
+// web search and the CSV export. Empty filters are allowed; it reports false
+// for a title longer than 100 characters or an unknown priority or status.
+func parseTaskFilters(values url.Values) (title, priority, status string, ok bool) {
+	title = strings.TrimSpace(values.Get("title"))
+	priority = strings.TrimSpace(values.Get("priority"))
+	status = strings.TrimSpace(values.Get("status"))
+	ok = utf8.RuneCountInString(title) <= 100 && (priority == "" || taskPriorities[priority]) && (status == "" || taskStatuses[status])
+	return title, priority, status, ok
+}
+
 func (s *server) searchTasks(w http.ResponseWriter, r *http.Request, requestID string) int {
 	if _, ok := s.currentUser(r); !ok {
 		return writeError(w, http.StatusUnauthorized, "Unauthorized")
 	}
 	values := r.URL.Query()
-	page, ok := parseTaskPageQuery(values)
-	query := taskSearchQuery{taskPageQuery: page, Title: strings.TrimSpace(values.Get("title")), Priority: strings.TrimSpace(values.Get("priority")), Status: strings.TrimSpace(values.Get("status"))}
-	if !ok || utf8.RuneCountInString(query.Title) > 100 || (query.Priority != "" && !taskPriorities[query.Priority]) || (query.Status != "" && !taskStatuses[query.Status]) {
+	page, pageOK := parseTaskPageQuery(values)
+	title, priority, status, filtersOK := parseTaskFilters(values)
+	if !pageOK || !filtersOK {
 		return writeError(w, http.StatusBadRequest, "Invalid search parameters")
 	}
+	query := taskSearchQuery{taskPageQuery: page, Title: title, Priority: priority, Status: status}
 	result, err := s.tasks.searchWebTasks(r.Context(), query, requestID)
 	if err != nil {
 		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
