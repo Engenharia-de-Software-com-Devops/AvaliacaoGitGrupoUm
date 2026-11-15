@@ -453,3 +453,32 @@ docker compose logs -f app | grep '"client":"cli"' | grep -E '"operation":"(list
 Os testes e a cobertura usam os comandos da issue #7. Os testes unitários cobrem as opções, a tabela e os códigos de saída da CLI, os parâmetros e as respostas 200/204/400/401/404/500 da API, a separação entre token da CLI e cookie da Web e as consultas SQL da CLI. O teste de integração executa a CLI real: lista com ordenação e uma tarefa por página, confere que o total é igual ao da listagem Web, exclui a tarefa e confirma pela API Web que ela não existe mais.
 
 O teste de integração do `update` de tarefa inexistente (#8) passou a informar `--status`: sem ele a API responde 422 (situação obrigatória na edição) antes de procurar a tarefa, e o teste esperava a mensagem de tarefa não encontrada.
+
+## Issue #10 — Busca avançada de tarefas (CLI)
+
+Após iniciar a aplicação e obter o token conforme a **Issue #7**, use o comando `search` da CLI. Todos os filtros são opcionais e podem ser combinados:
+
+```bash
+docker compose --profile cli run --rm --no-deps cli search \
+  --title "Revisar" --priority high --status pending \
+  --page 1 --page-size 5 --sort title --order asc
+```
+
+| Opção | Comportamento |
+|---|---|
+| `--title` | Trecho literal do título, sem diferenciar maiúsculas e minúsculas; até 100 caracteres |
+| `--priority` | `low`, `medium` ou `high` |
+| `--status` | `pending`, `in_progress` ou `done` |
+| `--page`, `--page-size`, `--sort`, `--order` | Mesmas opções da listagem CLI da issue #9 |
+
+Os filtros preenchidos são combinados com `AND`; sem filtros, a busca retorna todas as tarefas, paginadas. O título é literal: `%` e `_` não são curingas. A CLI usa `GET /api/cli/records/search` com `Authorization: Bearer <token>` e uma consulta SQL CLI própria. Sem token válido, a API retorna **401**; filtros ou opções inválidos retornam **400**. Com `TODO_TOKEN` ausente, a CLI avisa antes de fazer a requisição.
+
+Os mesmos filtros e a mesma ordenação produzem os mesmos resultados da busca Web. Para comparar páginas diretamente, use `--page-size 5`: a Web mostra cinco itens por página, enquanto a CLI usa dez por padrão.
+
+Cada busca gera eventos JSON com `client: "cli"` e `operation: "search"` na API e no banco, correlacionados pelo mesmo `request_id`. Requisições rejeitadas antes de acessar dados geram apenas o evento da API. Para acompanhar:
+
+```bash
+docker compose logs -f app | grep '"operation":"search"'
+```
+
+Os testes unitários, a cobertura de linhas e a integração com PostgreSQL usam os comandos da seção **Issue #1**. A integração compara resultados Web e CLI, filtros combinados, paginação, busca sem resultados, caracteres literais e rejeição de tokens ausentes ou inválidos.
