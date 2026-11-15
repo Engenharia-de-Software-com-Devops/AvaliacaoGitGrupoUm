@@ -71,3 +71,50 @@ docker compose --profile test run --build --rm integration
 ```
 
 O teste usa o usuário configurado, verifica login válido e inválido, sessão, healthcheck e hash da senha no banco. A CLI e as funcionalidades de tarefas serão adicionadas nas próximas issues.
+
+## Issue #2 — Cadastro e edição de tarefas (Web)
+
+### Campos da tarefa
+
+| Campo | Obrigatório | Regra de validação |
+|---|---|---|
+| `title` (Título) | sim | 3 a 100 caracteres |
+| `description` (Descrição) | não | até 500 caracteres |
+| `priority` (Prioridade) | sim | `low`, `medium` ou `high` |
+| `status` (Situação) | sim | `pending`, `in_progress` ou `done` |
+| `due_date` (Data de entrega) | sim | data válida no formato `AAAA-MM-DD` |
+| `category` (Categoria) | sim | 2 a 50 caracteres |
+
+Espaços no início e no fim dos textos são removidos antes da validação. As regras são verificadas no navegador e novamente na API; o banco também restringe `priority` e `status` com `CHECK`. A tabela `tasks` é criada automaticamente na inicialização da aplicação.
+
+### Usar pela Web
+
+1. Inicie a aplicação com `docker compose up --build` e entre em <http://localhost:8080>.
+2. Após o login, preencha o formulário **Nova tarefa** e clique em **Cadastrar tarefa**. Campos inválidos ficam destacados, com a mensagem de erro ao lado.
+3. Para editar, clique em **Editar** em uma tarefa da lista **Salvas nesta sessão** ou informe o ID em **Editar tarefa existente** e clique em **Carregar**. Altere os campos e clique em **Salvar alterações**; **Cancelar edição** volta ao modo de cadastro.
+
+A listagem completa das tarefas do banco será entregue na issue #3.
+
+### Endpoints
+
+Todos exigem a sessão obtida em `POST /api/web/login` e retornam **HTTP 401** sem sessão válida.
+
+| Método e rota | Função | Respostas |
+|---|---|---|
+| `POST /api/web/records` | Cadastra uma tarefa | 201 com a tarefa criada; 400 JSON inválido; 422 campos inválidos |
+| `PUT /api/web/records/{id}` | Edita uma tarefa | 200 com a tarefa atualizada; 400; 404 tarefa inexistente; 422 |
+| `GET /api/web/records/{id}` | Carrega uma tarefa para edição | 200 com a tarefa; 404 tarefa inexistente |
+
+A resposta 422 tem o formato `{"errors": {"campo": "mensagem"}}`, com uma mensagem por campo inválido.
+
+### Logs
+
+Cada requisição gera uma linha `layer: "api"` (`operation` igual a `create`, `update` ou `get`) e, quando chega ao banco, uma linha `layer: "db"` (`insert`, `update` ou `select`) com o mesmo `request_id`. Requisições rejeitadas por autenticação ou validação geram somente o log da API, com `status: "error"`. Para acompanhar:
+
+```bash
+docker compose logs -f app | grep -E '"operation":"(create|update|get|insert|select)"'
+```
+
+### Testes
+
+Os testes unitários de `api.go` e `db.go` cobrem validação, autenticação, respostas 400/401/404/422/500 e as consultas SQL, e rodam com os mesmos comandos da seção de testes da issue #1. O teste de integração também cadastra, valida, edita e recarrega uma tarefa, conferindo os valores gravados no PostgreSQL.
