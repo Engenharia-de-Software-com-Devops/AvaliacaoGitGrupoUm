@@ -263,6 +263,7 @@ func TestIntegration(t *testing.T) {
 	}
 	testCLISearchIntegration(t, base, cliToken, cookie, prefix)
 	testCLIExportIntegration(t, base, cliToken, cookie, prefix)
+	testCLIDashboardIntegration(t, base, cliToken, cookie)
 	exportCSV := func(values url.Values) [][]string {
 		status, body := call(http.MethodGet, "/api/web/records/export?"+values.Encode(), "", true)
 		records, err := csv.NewReader(bytes.NewReader(body)).ReadAll()
@@ -720,5 +721,85 @@ func testCLIExportIntegration(t *testing.T, base, token string, cookie *http.Coo
 	}
 	if _, errs, err := cli("export", "--priority", "urgent"); err == nil || !strings.Contains(errs, "Invalid export options") {
 		t.Fatalf("invalid CLI export options: %v %s", err, errs)
+	}
+}
+
+// testCLIDashboardIntegration runs the real CLI dashboard command and checks
+// that it shows exactly the indicators and values of the web dashboard.
+func testCLIDashboardIntegration(t *testing.T, base, token string, cookie *http.Cookie) {
+	t.Helper()
+	cli := func(bearer string, args ...string) (string, string, error) {
+		cmd := exec.Command("go", append([]string{"run", "./cli"}, args...)...)
+		cmd.Env = append(os.Environ(), "TODO_API_URL="+base, "TODO_TOKEN="+bearer)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		return stdout.String(), stderr.String(), err
+	}
+	if _, stderr, err := cli("", "dashboard"); err == nil || !strings.Contains(stderr, "Set TODO_TOKEN.") {
+		t.Fatalf("CLI dashboard without token: %v, %s", err, stderr)
+	}
+	if _, stderr, err := cli("invalid", "dashboard"); err == nil || !strings.Contains(stderr, "HTTP 401") {
+		t.Fatalf("CLI dashboard with an invalid token: %v, %s", err, stderr)
+	}
+	unauthorized, err := http.Get(base + "/api/cli/dashboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("missing CLI token dashboard status = %d", unauthorized.StatusCode)
+	}
+	request, err := http.NewRequest(http.MethodGet, base+"/api/web/dashboard", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.AddCookie(cookie)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type indicator struct {
+		Key   string `json:"key"`
+		Count int    `json:"count"`
+	}
+	var web struct {
+		Total      int         `json:"total"`
+		ByStatus   []indicator `json:"by_status"`
+		ByPriority []indicator `json:"by_priority"`
+		ByCategory []indicator `json:"by_category"`
+	}
+	decodeErr := json.NewDecoder(response.Body).Decode(&web)
+	response.Body.Close()
+	if decodeErr != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("web dashboard = %d (%v)", response.StatusCode, decodeErr)
+	}
+	stdout, stderr, err := cli(token, "dashboard")
+	if err != nil {
+		t.Fatalf("CLI dashboard failed: %v, %s", err, stderr)
+	}
+	// Rebuild the expected text from the web values: same sections, keys and counts.
+	expected := []string{fmt.Sprintf("Total: %d tasks", web.Total)}
+	for _, section := range []struct {
+		title string
+		items []indicator
+	}{{"Tasks by status", web.ByStatus}, {"Tasks by priority", web.ByPriority}, {"Tasks by category", web.ByCategory}} {
+		expected = append(expected, "", section.title)
+		for _, item := range section.items {
+			expected = append(expected, fmt.Sprintf("%s %d", item.Key, item.Count))
+		}
+	}
+	lines := strings.Split(strings.TrimSuffix(stdout, "\n"), "\n")
+	if len(lines) != len(expected) {
+		t.Fatalf("CLI dashboard = %q, web = %+v", stdout, web)
+	}
+	for i, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) == 3 && strings.HasSuffix(fields[2], "%") {
+			fields = fields[:2]
+		}
+		if strings.Join(fields, " ") != expected[i] {
+			t.Fatalf("CLI dashboard line %d = %q, web expects %q", i, line, expected[i])
+		}
 	}
 }
