@@ -178,3 +178,75 @@ func TestTaskCommands(t *testing.T) {
 		})
 	}
 }
+
+func TestListAndDeleteCommands(t *testing.T) {
+	token := map[string]string{"TODO_TOKEN": "cli-secret-token"}
+	page := `{"items":[{"id":7,"title":"Write report","description":"","priority":"high","status":"pending","due_date":"2026-11-20","category":"work"},` +
+		`{"id":9,"title":"Comprar café","description":"","priority":"low","status":"done","due_date":"2026-11-16","category":"casa"}],"page":2,"page_size":2,"total":5,"total_pages":3}`
+	for _, tc := range []struct {
+		name                 string
+		args                 []string
+		env                  map[string]string
+		status               int
+		body                 string
+		failure              bool
+		wantMethod, wantPath string
+		wantQuery            string
+		wantCode             int
+		wantStdout           string
+		wantStderr           string
+	}{
+		{name: "list defaults", args: []string{"list"}, env: token, status: 200, body: page, wantMethod: http.MethodGet, wantPath: "/api/cli/records",
+			wantQuery:  "order=asc&page=1&page_size=10&sort=id",
+			wantStdout: "ID  TITLE         PRIORITY  STATUS   DUE DATE    CATEGORY\n7   Write report  high      pending  2026-11-20  work\n9   Comprar café  low       done     2026-11-16  casa\nPage 2 of 3 (5 tasks)\n"},
+		{name: "list options", args: []string{"list", "--page", "2", "--page-size", "2", "--sort", "title", "--order", "desc"}, env: token, status: 200, body: page,
+			wantMethod: http.MethodGet, wantPath: "/api/cli/records", wantQuery: "order=desc&page=2&page_size=2&sort=title", wantStdout: "ID  TITLE"},
+		{name: "list empty", args: []string{"list"}, env: token, status: 200, body: `{"items":[],"page":1,"page_size":10,"total":0,"total_pages":0}`,
+			wantMethod: http.MethodGet, wantPath: "/api/cli/records", wantStdout: "No tasks found.\nPage 1 of 1 (0 tasks)\n"},
+		{name: "list invalid options", args: []string{"list", "--sort", "category"}, env: token, status: 400, wantMethod: http.MethodGet, wantPath: "/api/cli/records", wantCode: 2, wantStderr: "Invalid list options"},
+		{name: "list unauthorized", args: []string{"list"}, env: token, status: 401, wantMethod: http.MethodGet, wantPath: "/api/cli/records", wantCode: 1, wantStderr: "API returned HTTP 401."},
+		{name: "list invalid response", args: []string{"list"}, env: token, status: 200, body: `{`, wantMethod: http.MethodGet, wantPath: "/api/cli/records", wantCode: 1, wantStderr: "Invalid API response."},
+		{name: "list unknown flag", args: []string{"list", "--owner", "bob"}, env: token, wantCode: 2, wantStderr: "Usage:"},
+		{name: "list non numeric page", args: []string{"list", "--page", "two"}, env: token, wantCode: 2, wantStderr: "Usage:"},
+		{name: "list extra argument", args: []string{"list", "extra"}, env: token, wantCode: 2, wantStderr: "Usage:"},
+		{name: "list without token", args: []string{"list"}, wantCode: 2, wantStderr: "Set TODO_TOKEN."},
+		{name: "list network failure", args: []string{"list"}, env: token, failure: true, wantCode: 1, wantStderr: "API connection failed."},
+		{name: "list bad URL", args: []string{"list"}, env: map[string]string{"TODO_TOKEN": "cli-secret-token", "TODO_API_URL": "://bad"}, wantCode: 1, wantStderr: "Invalid API URL."},
+		{name: "delete", args: []string{"delete", "7"}, env: token, status: 204, wantMethod: http.MethodDelete, wantPath: "/api/cli/records/7", wantStdout: "Task 7 deleted.\n"},
+		{name: "delete missing task", args: []string{"delete", "7"}, env: token, status: 404, wantMethod: http.MethodDelete, wantPath: "/api/cli/records/7", wantCode: 1, wantStderr: "Task 7 not found."},
+		{name: "delete unauthorized", args: []string{"delete", "7"}, env: token, status: 401, wantMethod: http.MethodDelete, wantPath: "/api/cli/records/7", wantCode: 1, wantStderr: "API returned HTTP 401."},
+		{name: "delete without id", args: []string{"delete"}, env: token, wantCode: 2, wantStderr: "Usage:"},
+		{name: "delete with two ids", args: []string{"delete", "7", "8"}, env: token, wantCode: 2, wantStderr: "Usage:"},
+		{name: "delete with text id", args: []string{"delete", "abc"}, env: token, wantCode: 2, wantStderr: "positive integer"},
+		{name: "delete with zero id", args: []string{"delete", "0"}, env: token, wantCode: 2, wantStderr: "positive integer"},
+		{name: "delete without token", args: []string{"delete", "7"}, wantCode: 2, wantStderr: "Set TODO_TOKEN."},
+		{name: "delete network failure", args: []string{"delete", "7"}, env: token, failure: true, wantCode: 1, wantStderr: "API connection failed."},
+		{name: "delete bad URL", args: []string{"delete", "7"}, env: map[string]string{"TODO_TOKEN": "cli-secret-token", "TODO_API_URL": "://bad"}, wantCode: 1, wantStderr: "Invalid API URL."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+				if tc.failure {
+					return nil, errors.New("network failure")
+				}
+				if r.Method != tc.wantMethod || r.URL.Host != "app:8080" || r.URL.Path != tc.wantPath {
+					t.Fatalf("request = %s %s", r.Method, r.URL)
+				}
+				if tc.wantQuery != "" && r.URL.RawQuery != tc.wantQuery {
+					t.Fatalf("query = %s", r.URL.RawQuery)
+				}
+				if r.Header.Get("Authorization") != "Bearer cli-secret-token" {
+					t.Fatalf("headers = %v", r.Header)
+				}
+				return &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body)), Header: make(http.Header)}, nil
+			})}
+			var stdout, stderr bytes.Buffer
+			code := run(tc.args, func(k string) string { return tc.env[k] }, client, &stdout, &stderr)
+			if code != tc.wantCode || !strings.HasPrefix(stdout.String(), tc.wantStdout) || !strings.Contains(stderr.String(), tc.wantStderr) {
+				t.Fatalf("code = %d, stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
+			}
+			if strings.Contains(stdout.String()+stderr.String(), "cli-secret-token") {
+				t.Fatal("token printed")
+			}
+		})
+	}
+}
