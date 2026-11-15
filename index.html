@@ -37,6 +37,27 @@
     .actions { display: flex; gap: .7rem; flex-wrap: wrap; }
     #export-csv { display: inline-block; width: auto; margin: 0; padding: .3rem .7rem; }
     .hint { color: #555; font-size: .9rem; }
+    #dashboard { margin-top: 2rem; }
+    .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 1rem; }
+    .chart { border: 1px solid #ddd; border-radius: .4rem; padding: 1rem; margin: 0; }
+    .chart h3 { margin: 0 0 .8rem; font-size: 1rem; }
+    .donut { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+    .donut svg { width: 8rem; height: 8rem; flex: none; }
+    .legend { list-style: none; margin: 0; padding: 0; font-size: .9rem; }
+    .legend li { display: flex; align-items: center; gap: .4rem; margin: .25rem 0; }
+    .swatch { width: .8rem; height: .8rem; border-radius: .15rem; flex: none; }
+    .columns { display: flex; align-items: flex-end; gap: .8rem; height: 9rem; border-bottom: 1px solid #999; }
+    .column { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; }
+    .column .bar { width: 100%; max-width: 3rem; border-radius: .2rem .2rem 0 0; min-height: 1px; }
+    .column .value { font-weight: bold; font-size: .9rem; margin-bottom: .2rem; }
+    .column-labels { display: flex; gap: .8rem; font-size: .85rem; }
+    .column-labels span { flex: 1; text-align: center; }
+    .hbar { display: grid; grid-template-columns: 6.5rem 1fr 2rem; align-items: center; gap: .4rem; margin: .3rem 0; font-size: .9rem; }
+    .hbar .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .hbar .track { background: #eee; border-radius: .2rem; height: .9rem; }
+    .hbar .bar { background: #3b6fb6; height: 100%; border-radius: .2rem; min-width: 1px; }
+    .hbar .value { text-align: right; font-weight: bold; }
+    #dashboard-error { color: #a00; }
   </style>
 </head>
 <body>
@@ -172,6 +193,27 @@
         <button type="button" id="export-csv">Exportar CSV</button>
       </div>
       <p id="export-hint" class="hint">O CSV inclui todas as tarefas da busca ativa (ou todas, sem filtros), não só a página exibida.</p>
+
+      <section id="dashboard" aria-labelledby="dashboard-heading">
+        <h2 id="dashboard-heading">Dashboard</h2>
+        <p id="dashboard-total" class="hint"></p>
+        <p id="dashboard-error" role="alert"></p>
+        <div class="charts">
+          <figure class="chart" id="chart-status">
+            <h3>Tarefas por situação</h3>
+            <div class="donut"></div>
+          </figure>
+          <figure class="chart" id="chart-priority">
+            <h3>Tarefas por prioridade</h3>
+            <div class="columns"></div>
+            <div class="column-labels"></div>
+          </figure>
+          <figure class="chart" id="chart-category">
+            <h3>Tarefas por categoria</h3>
+            <div class="hbars"></div>
+          </figure>
+        </div>
+      </section>
     </section>
   </main>
   <script>
@@ -201,7 +243,101 @@
       welcome.hidden = false;
       form.hidden = true;
       tasksSection.hidden = false;
-      await loadList();
+      await Promise.all([loadList(), loadDashboard()]);
+    }
+
+    // Dashboard: three charts drawn with plain HTML/SVG from GET /api/web/dashboard.
+    const statusColors = { pending: '#d98c1f', in_progress: '#3b6fb6', done: '#2e8b57' };
+    const priorityColors = { low: '#7aa874', medium: '#d9a21f', high: '#c0392b' };
+    function element(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    }
+    function percent(count, total) {
+      return total ? Math.round((count / total) * 100) : 0;
+    }
+    function drawDonut(container, items, total) {
+      const svgNS = 'http://www.w3.org/2000/svg';
+      const svg = document.createElementNS(svgNS, 'svg');
+      svg.setAttribute('viewBox', '0 0 42 42');
+      svg.setAttribute('role', 'img');
+      svg.setAttribute('aria-label', items.map((item) => `${statusLabels[item.key]}: ${item.count}`).join(', '));
+      const ring = (color, length, offset) => {
+        const circle = document.createElementNS(svgNS, 'circle');
+        for (const [name, value] of Object.entries({ cx: 21, cy: 21, r: 15.915, fill: 'none', stroke: color, 'stroke-width': 6 })) circle.setAttribute(name, value);
+        // A circumference of 100 makes each dash length equal to its percentage.
+        circle.setAttribute('stroke-dasharray', `${length} ${100 - length}`);
+        circle.setAttribute('stroke-dashoffset', 25 - offset);
+        return circle;
+      };
+      svg.append(ring('#eee', 100, 0));
+      let offset = 0;
+      for (const item of items) {
+        if (!item.count) continue;
+        const length = (item.count / total) * 100;
+        svg.append(ring(statusColors[item.key], length, offset));
+        offset += length;
+      }
+      const label = document.createElementNS(svgNS, 'text');
+      for (const [name, value] of Object.entries({ x: 21, y: 23.5, 'text-anchor': 'middle', 'font-size': 7, 'font-weight': 'bold' })) label.setAttribute(name, value);
+      label.textContent = total;
+      svg.append(label);
+      const legend = element('ul', 'legend');
+      for (const item of items) {
+        const li = element('li');
+        const swatch = element('span', 'swatch');
+        swatch.style.background = statusColors[item.key];
+        li.append(swatch, `${statusLabels[item.key]}: ${item.count} (${percent(item.count, total)}%)`);
+        legend.append(li);
+      }
+      container.replaceChildren(svg, legend);
+    }
+    function drawColumns(chart, items) {
+      const max = Math.max(1, ...items.map((item) => item.count));
+      chart.querySelector('.columns').replaceChildren(...items.map((item) => {
+        const column = element('div', 'column');
+        column.setAttribute('aria-label', `${priorityLabels[item.key]}: ${item.count}`);
+        const bar = element('div', 'bar');
+        bar.style.height = `${(item.count / max) * 85}%`;
+        bar.style.background = priorityColors[item.key];
+        column.append(element('span', 'value', item.count), bar);
+        return column;
+      }));
+      chart.querySelector('.column-labels').replaceChildren(...items.map((item) => element('span', '', priorityLabels[item.key])));
+    }
+    function drawHorizontalBars(container, items) {
+      if (!items.length) {
+        container.replaceChildren(element('p', 'hint', 'Nenhuma categoria cadastrada.'));
+        return;
+      }
+      const max = Math.max(...items.map((item) => item.count));
+      container.replaceChildren(...items.map((item) => {
+        const row = element('div', 'hbar');
+        const label = element('span', 'label', item.key);
+        label.title = item.key;
+        const track = element('div', 'track');
+        const bar = element('div', 'bar');
+        bar.style.width = `${(item.count / max) * 100}%`;
+        track.append(bar);
+        row.append(label, track, element('span', 'value', item.count));
+        return row;
+      }));
+    }
+    async function loadDashboard() {
+      const dashboardError = document.getElementById('dashboard-error');
+      dashboardError.textContent = '';
+      try {
+        const response = await fetch('/api/web/dashboard');
+        if (response.status === 401) { dashboardError.textContent = 'Sessão expirada. Recarregue a página e entre novamente.'; return; }
+        if (!response.ok) { dashboardError.textContent = 'Não foi possível carregar os indicadores.'; return; }
+        const data = await response.json();
+        document.getElementById('dashboard-total').textContent = `${data.total} tarefa(s) no total. Os valores vêm do banco e são atualizados ao recarregar a página ou alterar tarefas.`;
+        drawDonut(document.querySelector('#chart-status .donut'), data.by_status, data.total);
+        drawColumns(document.getElementById('chart-priority'), data.by_priority);
+        drawHorizontalBars(document.querySelector('#chart-category .hbars'), data.by_category);
+      } catch (_) { dashboardError.textContent = 'Não foi possível conectar ao servidor.'; }
     }
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
@@ -359,7 +495,7 @@
       }
       if (deleted) listMessage.textContent = `${deleted} tarefa(s) excluída(s).`;
       if (failed.length) listError.textContent = `Não foi possível excluir: ${failed.join(', ')}.`;
-      await loadList();
+      await Promise.all([loadList(), loadDashboard()]);
     }
     async function loadTask(id) {
       taskError.textContent = '';
@@ -407,7 +543,7 @@
         const result = await response.json();
         taskMessage.textContent = editingId ? `Tarefa #${result.id} atualizada.` : `Tarefa #${result.id} cadastrada.`;
         resetForm();
-        await loadList();
+        await Promise.all([loadList(), loadDashboard()]);
       } catch (_) { taskError.textContent = 'Não foi possível conectar ao servidor.'; }
     });
 
