@@ -470,7 +470,7 @@ func testCLITaskIntegration(t *testing.T, base, username, password, token string
 	if stdout, stderr, err := cli(token, edited...); err != nil || !strings.Contains(stdout, "status: in_progress") {
 		t.Fatalf("CLI update failed: %v, %s", err, stderr)
 	}
-	if _, stderr, err := cli(token, append([]string{"update", "999999999"}, fields...)...); err == nil || !strings.Contains(stderr, "not found") {
+	if _, stderr, err := cli(token, append([]string{"update", "999999999", "--status", "pending"}, fields...)...); err == nil || !strings.Contains(stderr, "not found") {
 		t.Fatalf("CLI update of a missing task: %v, %s", err, stderr)
 	}
 	credentials, err := json.Marshal(map[string]string{"username": username, "password": password})
