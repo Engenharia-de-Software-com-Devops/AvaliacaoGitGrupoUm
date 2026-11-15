@@ -90,3 +90,57 @@ func (d *database) authenticate(ctx context.Context, username, password, request
 	}
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil, nil
 }
+
+// task is a ToDo List record shared by the web and, later, the CLI endpoints.
+type task struct {
+	ID          int64  `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Priority    string `json:"priority"`
+	Status      string `json:"status"`
+	DueDate     string `json:"due_date"`
+	Category    string `json:"category"`
+}
+
+var errTaskNotFound = errors.New("task not found")
+
+const webTaskColumns = `id, title, description, priority, status, to_char(due_date, 'YYYY-MM-DD'), category`
+
+func (d *database) logOutcome(operation, requestID, message string, err error) {
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	logEvent(d.logs, "db", operation, status, requestID, message)
+}
+
+// scanTask reads a single task row and maps a missing row to errTaskNotFound.
+func scanTask(row *sql.Row) (found task, err error) {
+	err = row.Scan(&found.ID, &found.Title, &found.Description, &found.Priority, &found.Status, &found.DueDate, &found.Category)
+	if errors.Is(err, sql.ErrNoRows) {
+		return task{}, errTaskNotFound
+	}
+	return found, err
+}
+
+func (d *database) createWebTask(ctx context.Context, input task, requestID string) (created task, err error) {
+	defer func() { d.logOutcome("insert", requestID, "Web task persisted", err) }()
+	return scanTask(d.conn.QueryRowContext(ctx, `INSERT INTO tasks (title, description, priority, status, due_date, category)
+		VALUES ($1, $2, $3, $4, $5::date, $6)
+		RETURNING `+webTaskColumns,
+		input.Title, input.Description, input.Priority, input.Status, input.DueDate, input.Category))
+}
+
+func (d *database) updateWebTask(ctx context.Context, id int64, input task, requestID string) (updated task, err error) {
+	defer func() { d.logOutcome("update", requestID, "Web task updated", err) }()
+	return scanTask(d.conn.QueryRowContext(ctx, `UPDATE tasks SET title = $1, description = $2, priority = $3, status = $4,
+		due_date = $5::date, category = $6, updated_at = now()
+		WHERE id = $7
+		RETURNING `+webTaskColumns,
+		input.Title, input.Description, input.Priority, input.Status, input.DueDate, input.Category, id))
+}
+
+func (d *database) getWebTask(ctx context.Context, id int64, requestID string) (found task, err error) {
+	defer func() { d.logOutcome("select", requestID, "Web task loaded", err) }()
+	return scanTask(d.conn.QueryRowContext(ctx, `SELECT `+webTaskColumns+` FROM tasks WHERE id = $1`, id))
+}

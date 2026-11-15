@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql/driver"
 	"errors"
 	"strings"
 	"testing"
@@ -120,5 +121,80 @@ func TestDatabaseAuthenticate(t *testing.T) {
 				t.Fatal("invalid or unsafe db log")
 			}
 		})
+	}
+}
+
+var sampleTask = task{Title: "Write report", Description: "Quarterly numbers", Priority: "high", Status: "pending", DueDate: "2026-11-20", Category: "work"}
+
+func taskRows(t task) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{"id", "title", "description", "priority", "status", "due_date", "category"}).
+		AddRow(t.ID, t.Title, t.Description, t.Priority, t.Status, t.DueDate, t.Category)
+}
+
+func TestDatabaseWebTasks(t *testing.T) {
+	stored := sampleTask
+	stored.ID = 7
+	args := []driver.Value{sampleTask.Title, sampleTask.Description, sampleTask.Priority, sampleTask.Status, sampleTask.DueDate, sampleTask.Category}
+	for _, tc := range []struct {
+		name, operation, query string
+		args                   []driver.Value
+		call                   func(*database) (task, error)
+	}{
+		{name: "insert", operation: "insert", query: "INSERT INTO tasks", args: args, call: func(d *database) (task, error) {
+			return d.createWebTask(context.Background(), sampleTask, "req-9")
+		}},
+		{name: "update", operation: "update", query: "UPDATE tasks SET", args: append(append([]driver.Value{}, args...), int64(7)), call: func(d *database) (task, error) {
+			return d.updateWebTask(context.Background(), 7, sampleTask, "req-9")
+		}},
+		{name: "select", operation: "select", query: "SELECT (.+) FROM tasks WHERE id", args: []driver.Value{int64(7)}, call: func(d *database) (task, error) {
+			return d.getWebTask(context.Background(), 7, "req-9")
+		}},
+	} {
+		for _, outcome := range []string{"success", "not found", "failure"} {
+			t.Run(tc.name+" "+outcome, func(t *testing.T) {
+				conn, mock, err := sqlmock.New()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Close()
+				query := mock.ExpectQuery(tc.query).WithArgs(tc.args...)
+				switch outcome {
+				case "success":
+					query.WillReturnRows(taskRows(stored))
+				case "not found":
+					query.WillReturnRows(sqlmock.NewRows([]string{"id"}))
+				default:
+					query.WillReturnError(errors.New("database unavailable"))
+				}
+				var logs bytes.Buffer
+				got, err := tc.call(&database{conn: conn, logs: &logs})
+				switch outcome {
+				case "success":
+					if err != nil || got != stored {
+						t.Fatalf("got %+v, %v", got, err)
+					}
+				case "not found":
+					if !errors.Is(err, errTaskNotFound) {
+						t.Fatalf("error = %v, want errTaskNotFound", err)
+					}
+				default:
+					if err == nil || errors.Is(err, errTaskNotFound) {
+						t.Fatalf("error = %v, want database failure", err)
+					}
+				}
+				if err := mock.ExpectationsWereMet(); err != nil {
+					t.Fatal(err)
+				}
+				want := `"layer":"db","client":"web","operation":"` + tc.operation + `","status":"`
+				if outcome == "success" {
+					want += `success"`
+				} else {
+					want += `error"`
+				}
+				if !strings.Contains(logs.String(), want) || !strings.Contains(logs.String(), `"request_id":"req-9"`) {
+					t.Fatalf("unexpected db log: %s", logs.String())
+				}
+			})
+		}
 	}
 }
