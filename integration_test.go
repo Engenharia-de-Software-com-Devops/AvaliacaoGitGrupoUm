@@ -503,7 +503,62 @@ func testCLITaskIntegration(t *testing.T, base, username, password, token string
 	if status != http.StatusOK || !strings.Contains(body, `"title":"CLI integration task edited"`) || !strings.Contains(body, `"status":"in_progress"`) || !strings.Contains(body, `"due_date":"2026-12-24"`) {
 		t.Fatalf("CLI task not visible on the web: %d %s", status, body)
 	}
-	if status, _ := webCall(http.MethodDelete); status != http.StatusNoContent {
-		t.Fatalf("cleanup of CLI task status = %d", status)
+	testCLIListAndDeleteIntegration(t, base, token, id, login.Cookies()[0], cli, webCall)
+}
+
+// testCLIListAndDeleteIntegration lists and deletes the CLI task through the
+// CLI binary and checks through the web API that the deletion is visible.
+func testCLIListAndDeleteIntegration(t *testing.T, base, token string, id int64, cookie *http.Cookie,
+	cli func(string, ...string) (string, string, error), webCall func(string) (int, string)) {
+	t.Helper()
+	if _, stderr, err := cli("", "list"); err == nil || !strings.Contains(stderr, "Set TODO_TOKEN.") {
+		t.Fatalf("CLI list without token: %v, %s", err, stderr)
+	}
+	if _, stderr, err := cli(token, "list", "--sort", "category"); err == nil || !strings.Contains(stderr, "Invalid list options") {
+		t.Fatalf("CLI list with an invalid sort: %v, %s", err, stderr)
+	}
+	stdout, stderr, err := cli(token, "list", "--page-size", "100", "--sort", "id", "--order", "desc")
+	if err != nil || !strings.HasPrefix(stdout, "ID  ") || !strings.Contains(stdout, "CLI integration task edited") {
+		t.Fatalf("CLI list failed: %v, %s%s", err, stdout, stderr)
+	}
+	if first := strings.Fields(strings.Split(stdout, "\n")[1])[0]; first != fmt.Sprint(id) {
+		t.Fatalf("newest task first: got id %s, want %d", first, id)
+	}
+	stdout, stderr, err = cli(token, "list", "--page-size", "1")
+	var page, pages, total int
+	if err != nil || len(strings.Split(strings.TrimSpace(stdout), "\n")) != 3 {
+		t.Fatalf("CLI list with one task per page: %v, %s%s", err, stdout, stderr)
+	}
+	if _, err := fmt.Sscanf(stdout[strings.LastIndex(strings.TrimSpace(stdout), "\n")+1:], "Page %d of %d (%d tasks)", &page, &pages, &total); err != nil || page != 1 || pages != total {
+		t.Fatalf("CLI pagination footer = %q (%v)", stdout, err)
+	}
+	request, err := http.NewRequest(http.MethodGet, base+"/api/web/records", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.AddCookie(cookie)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var web struct {
+		Total int `json:"total"`
+	}
+	decodeErr := json.NewDecoder(response.Body).Decode(&web)
+	response.Body.Close()
+	if decodeErr != nil || web.Total != total {
+		t.Fatalf("CLI total %d differs from the web total %d (%v)", total, web.Total, decodeErr)
+	}
+	if _, stderr, err := cli("", "delete", fmt.Sprint(id)); err == nil || !strings.Contains(stderr, "Set TODO_TOKEN.") {
+		t.Fatalf("CLI delete without token: %v, %s", err, stderr)
+	}
+	if stdout, stderr, err := cli(token, "delete", fmt.Sprint(id)); err != nil || stdout != fmt.Sprintf("Task %d deleted.\n", id) {
+		t.Fatalf("CLI delete failed: %v, %s%s", err, stdout, stderr)
+	}
+	if status, _ := webCall(http.MethodGet); status != http.StatusNotFound {
+		t.Fatalf("task deleted by the CLI still visible on the web: %d", status)
+	}
+	if _, stderr, err := cli(token, "delete", fmt.Sprint(id)); err == nil || !strings.Contains(stderr, "not found") {
+		t.Fatalf("CLI delete of a missing task: %v, %s", err, stderr)
 	}
 }
