@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	_ "embed"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -40,6 +41,7 @@ type taskStore interface {
 	getWebTask(context.Context, int64, string) (task, error)
 	listWebTasks(context.Context, taskPageQuery, string) (taskPage, error)
 	searchWebTasks(context.Context, taskSearchQuery, string) (taskPage, error)
+	exportWebTasks(context.Context, taskExportQuery, string) ([]task, error)
 	deleteWebTask(context.Context, int64, string) error
 }
 
@@ -80,6 +82,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/api/web/records/search":
 		operation = "search"
 		status = s.searchTasks(w, r, id)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/web/records/export":
+		operation = "export"
+		status = s.exportTasks(w, r, id)
 	case r.Method == http.MethodGet && webRecordID(r.URL.Path) > 0:
 		operation = "get"
 		status = s.getTask(w, r, id, webRecordID(r.URL.Path))
@@ -299,6 +304,45 @@ func (s *server) searchTasks(w http.ResponseWriter, r *http.Request, requestID s
 		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
 	}
 	return writeJSON(w, http.StatusOK, result)
+}
+
+// taskCSVHeader lists the exported columns in the order they appear in the file.
+var taskCSVHeader = []string{"id", "title", "description", "priority", "status", "due_date", "category"}
+
+// writeTasksCSV writes the header and one RFC 4180 record per task; commas,
+// quotes and line breaks inside values are quoted by encoding/csv.
+func writeTasksCSV(w io.Writer, items []task) error {
+	records := [][]string{taskCSVHeader}
+	for _, item := range items {
+		records = append(records, []string{strconv.FormatInt(item.ID, 10), item.Title, item.Description, item.Priority, item.Status, item.DueDate, item.Category})
+	}
+	return csv.NewWriter(w).WriteAll(records)
+}
+
+// exportTasks answers a CSV download with every task matching the active web
+// search filters; paging parameters are ignored so the file is never limited
+// to the page shown in the table.
+func (s *server) exportTasks(w http.ResponseWriter, r *http.Request, requestID string) int {
+	if _, ok := s.currentUser(r); !ok {
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+	}
+	values := r.URL.Query()
+	values.Del("page")
+	order, orderOK := parseTaskPageQuery(values)
+	title, priority, status, filtersOK := parseTaskFilters(values)
+	if !orderOK || !filtersOK {
+		return writeError(w, http.StatusBadRequest, "Invalid export parameters")
+	}
+	query := taskExportQuery{Title: title, Priority: priority, Status: status, Sort: order.Sort, Order: order.Order}
+	items, err := s.tasks.exportWebTasks(r.Context(), query, requestID)
+	if err != nil {
+		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="tarefas.csv"`)
+	w.WriteHeader(http.StatusOK)
+	_ = writeTasksCSV(w, items)
+	return http.StatusOK
 }
 
 func (s *server) deleteTask(w http.ResponseWriter, r *http.Request, requestID string, id int64) int {

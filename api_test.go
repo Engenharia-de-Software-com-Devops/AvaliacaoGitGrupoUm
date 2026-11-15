@@ -238,6 +238,8 @@ type fakeTasks struct {
 	saved     task
 	query     taskPageQuery
 	search    taskSearchQuery
+	export    taskExportQuery
+	exported  []task
 	id        int64
 	err       error
 	requestID string
@@ -287,6 +289,15 @@ func (f *fakeTasks) searchWebTasks(_ context.Context, query taskSearchQuery, req
 		return taskPage{}, f.err
 	}
 	return taskPage{Items: []task{sampleTask}, Page: query.Page, PageSize: webPageSize, Total: 1, TotalPages: 1}, nil
+}
+
+func (f *fakeTasks) exportWebTasks(_ context.Context, query taskExportQuery, requestID string) ([]task, error) {
+	f.calls++
+	f.export, f.requestID = query, requestID
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.exported, nil
 }
 
 func (f *fakeTasks) deleteWebTask(_ context.Context, id int64, requestID string) error {
@@ -528,6 +539,80 @@ func TestWebTaskSearchFailures(t *testing.T) {
 				t.Fatalf("status = %d, store calls = %d", response.Code, store.calls)
 			}
 			if !strings.Contains(logs.String(), `"operation":"search","status":"error"`) {
+				t.Fatalf("failure not logged: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestWebTaskExport(t *testing.T) {
+	tricky := task{ID: 8, Title: `Say "hi", then leave`, Description: "line one\nline two", Priority: "low", Status: "done", DueDate: "2026-12-01", Category: "café"}
+	stored := sampleTask
+	stored.ID = 7
+	for _, tc := range []struct {
+		name, query string
+		items       []task
+		want        taskExportQuery
+		wantCSV     string
+	}{
+		{name: "no filters exports everything", items: []task{stored, tricky}, want: taskExportQuery{Sort: "id", Order: "asc"},
+			wantCSV: "id,title,description,priority,status,due_date,category\n" +
+				"7,Write report,Quarterly numbers,high,pending,2026-11-20,work\n" +
+				"8,\"Say \"\"hi\"\", then leave\",\"line one\nline two\",low,done,2026-12-01,café\n"},
+		{name: "combined filters ignore paging", query: "?title=+report+&priority=high&status=pending&sort=due_date&order=desc&page=3", items: []task{stored},
+			want:    taskExportQuery{Title: "report", Priority: "high", Status: "pending", Sort: "due_date", Order: "desc"},
+			wantCSV: "id,title,description,priority,status,due_date,category\n7,Write report,Quarterly numbers,high,pending,2026-11-20,work\n"},
+		{name: "no matches keeps the header", query: "?status=done", items: []task{}, want: taskExportQuery{Status: "done", Sort: "id", Order: "asc"},
+			wantCSV: "id,title,description,priority,status,due_date,category\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{exported: tc.items}
+			server, logs := taskServer(store)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, taskRequest(http.MethodGet, "/api/web/records/export"+tc.query, "", true))
+			if response.Code != http.StatusOK || store.export != tc.want {
+				t.Fatalf("status = %d, query = %+v, want %+v", response.Code, store.export, tc.want)
+			}
+			if response.Header().Get("Content-Type") != "text/csv; charset=utf-8" || response.Header().Get("Content-Disposition") != `attachment; filename="tarefas.csv"` {
+				t.Fatalf("unexpected headers: %v", response.Header())
+			}
+			if response.Body.String() != tc.wantCSV {
+				t.Fatalf("csv = %q, want %q", response.Body.String(), tc.wantCSV)
+			}
+			if store.requestID == "" || !strings.Contains(logs.String(), `"operation":"export","status":"success","request_id":"`+store.requestID+`"`) {
+				t.Fatalf("export API log not correlated: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestWebTaskExportFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, query   string
+		authenticated bool
+		storeErr      error
+		want          int
+	}{
+		{name: "unauthenticated", want: http.StatusUnauthorized},
+		{name: "invalid priority", query: "?priority=urgent", authenticated: true, want: http.StatusBadRequest},
+		{name: "invalid status", query: "?status=unknown", authenticated: true, want: http.StatusBadRequest},
+		{name: "title too long", query: "?title=" + strings.Repeat("a", 101), authenticated: true, want: http.StatusBadRequest},
+		{name: "invalid sort", query: "?sort=description", authenticated: true, want: http.StatusBadRequest},
+		{name: "invalid order", query: "?order=up", authenticated: true, want: http.StatusBadRequest},
+		{name: "store error", authenticated: true, storeErr: errors.New("database down"), want: http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{err: tc.storeErr}
+			server, logs := taskServer(store)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, taskRequest(http.MethodGet, "/api/web/records/export"+tc.query, "", tc.authenticated))
+			if response.Code != tc.want || (store.calls > 0) != (tc.storeErr != nil) {
+				t.Fatalf("status = %d, store calls = %d", response.Code, store.calls)
+			}
+			if strings.HasPrefix(response.Header().Get("Content-Type"), "text/csv") {
+				t.Fatal("failed export answered as CSV")
+			}
+			if !strings.Contains(logs.String(), `"operation":"export","status":"error"`) {
 				t.Fatalf("failure not logged: %s", logs.String())
 			}
 		})
