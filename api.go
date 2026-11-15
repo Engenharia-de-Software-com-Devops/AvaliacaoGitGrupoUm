@@ -48,6 +48,8 @@ type taskStore interface {
 	exportWebTasks(context.Context, taskExportQuery, string) ([]task, error)
 	deleteWebTask(context.Context, int64, string) error
 	webDashboard(context.Context, string) (dashboard, error)
+	createCLITask(context.Context, task, string) (task, error)
+	updateCLITask(context.Context, int64, task, string) (task, error)
 }
 
 type server struct {
@@ -81,6 +83,12 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/api/cli/session":
 		operation = "session"
 		status = s.cliSession(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/cli/records":
+		operation = "create"
+		status = s.saveCLITask(w, r, id, 0)
+	case r.Method == http.MethodPut && cliRecordID(r.URL.Path) > 0:
+		operation = "update"
+		status = s.saveCLITask(w, r, id, cliRecordID(r.URL.Path))
 	case r.Method == http.MethodGet && r.URL.Path == "/api/web/health":
 		operation, status = "health", http.StatusOK
 	case r.Method == http.MethodPost && r.URL.Path == "/api/web/login":
@@ -288,6 +296,30 @@ func recordID(prefix, path string) int64 {
 // webRecordID extracts a positive task id from /api/web/records/{id}, or returns 0.
 func webRecordID(path string) int64 {
 	return recordID("/api/web/records/", path)
+}
+
+// cliRecordID extracts a positive task id from /api/cli/records/{id}, or returns 0.
+func cliRecordID(path string) int64 {
+	return recordID("/api/cli/records/", path)
+}
+
+// saveCLITask creates (id 0) or replaces a task for the CLI. It accepts only a
+// valid Bearer token, never the web session cookie, and applies the same
+// validation as the web form before calling the CLI-specific SQL.
+func (s *server) saveCLITask(w http.ResponseWriter, r *http.Request, requestID string, id int64) int {
+	if _, ok := s.currentCLIUser(r); !ok {
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+	}
+	input, rejected := decodeTask(w, r)
+	if rejected != 0 {
+		return rejected
+	}
+	if id == 0 {
+		saved, err := s.tasks.createCLITask(r.Context(), input, requestID)
+		return respondTask(w, http.StatusCreated, saved, err)
+	}
+	saved, err := s.tasks.updateCLITask(r.Context(), id, input, requestID)
+	return respondTask(w, http.StatusOK, saved, err)
 }
 
 // decodeTask reads, normalizes and validates a task payload shared by the web
