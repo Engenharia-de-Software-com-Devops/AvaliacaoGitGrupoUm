@@ -43,6 +43,7 @@ type taskStore interface {
 	searchWebTasks(context.Context, taskSearchQuery, string) (taskPage, error)
 	exportWebTasks(context.Context, taskExportQuery, string) ([]task, error)
 	deleteWebTask(context.Context, int64, string) error
+	webDashboard(context.Context, string) (dashboard, error)
 }
 
 type server struct {
@@ -85,6 +86,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/api/web/records/export":
 		operation = "export"
 		status = s.exportTasks(w, r, id)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/web/dashboard":
+		operation = "dashboard"
+		status = s.dashboard(w, r, id)
 	case r.Method == http.MethodGet && webRecordID(r.URL.Path) > 0:
 		operation = "get"
 		status = s.getTask(w, r, id, webRecordID(r.URL.Path))
@@ -343,6 +347,18 @@ func (s *server) exportTasks(w http.ResponseWriter, r *http.Request, requestID s
 	w.WriteHeader(http.StatusOK)
 	_ = writeTasksCSV(w, items)
 	return http.StatusOK
+}
+
+// dashboard answers the three web indicators computed from the database.
+func (s *server) dashboard(w http.ResponseWriter, r *http.Request, requestID string) int {
+	if _, ok := s.currentUser(r); !ok {
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+	}
+	result, err := s.tasks.webDashboard(r.Context(), requestID)
+	if err != nil {
+		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
+	}
+	return writeJSON(w, http.StatusOK, result)
 }
 
 func (s *server) deleteTask(w http.ResponseWriter, r *http.Request, requestID string, id int64) int {

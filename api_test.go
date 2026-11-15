@@ -618,3 +618,64 @@ func TestWebTaskExportFailures(t *testing.T) {
 		})
 	}
 }
+
+func (f *fakeTasks) webDashboard(_ context.Context, requestID string) (dashboard, error) {
+	f.calls++
+	f.requestID = requestID
+	if f.err != nil {
+		return dashboard{}, f.err
+	}
+	return dashboard{
+		Total:      3,
+		ByStatus:   []countItem{{"pending", 2}, {"in_progress", 0}, {"done", 1}},
+		ByPriority: []countItem{{"low", 1}, {"medium", 0}, {"high", 2}},
+		ByCategory: []countItem{{"work", 3}},
+	}, nil
+}
+
+func TestWebDashboard(t *testing.T) {
+	store := &fakeTasks{}
+	server, logs := taskServer(store)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, taskRequest(http.MethodGet, "/api/web/dashboard", "", true))
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("status = %d, body %s", response.Code, response.Body.String())
+	}
+	want := `{"total":3,"by_status":[{"key":"pending","count":2},{"key":"in_progress","count":0},{"key":"done","count":1}],` +
+		`"by_priority":[{"key":"low","count":1},{"key":"medium","count":0},{"key":"high","count":2}],"by_category":[{"key":"work","count":3}]}`
+	if strings.TrimSpace(response.Body.String()) != want {
+		t.Fatalf("body = %s", response.Body.String())
+	}
+	wantLog := `"layer":"api","client":"web","operation":"dashboard","status":"success","request_id":"` + store.requestID + `"`
+	if store.requestID == "" || !strings.Contains(logs.String(), wantLog) {
+		t.Fatalf("API log not correlated: %s", logs.String())
+	}
+}
+
+func TestWebDashboardFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		authenticated bool
+		storeErr      error
+		want          int
+	}{
+		{name: "without session", want: http.StatusUnauthorized},
+		{name: "storage failure", authenticated: true, storeErr: errors.New("database down"), want: http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTasks{err: tc.storeErr}
+			server, logs := taskServer(store)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, taskRequest(http.MethodGet, "/api/web/dashboard", "", tc.authenticated))
+			if response.Code != tc.want {
+				t.Fatalf("status = %d, want %d", response.Code, tc.want)
+			}
+			if (tc.storeErr == nil) != (store.calls == 0) {
+				t.Fatalf("store calls = %d", store.calls)
+			}
+			if !strings.Contains(logs.String(), `"operation":"dashboard","status":"error"`) {
+				t.Fatalf("failure not logged: %s", logs.String())
+			}
+		})
+	}
+}
