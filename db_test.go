@@ -874,7 +874,7 @@ func TestDatabaseCLITaskExport(t *testing.T) {
 			defer conn.Close()
 			direction := strings.ToUpper(tc.order)
 			// The CLI export query has no LIMIT/OFFSET: every filtered row is returned.
-			expected := mock.ExpectQuery(regexp.QuoteMeta("FROM tasks AS cli_task "+where+" ORDER BY cli_task.due_date "+direction+", cli_task.id "+direction) + "$").WithArgs("report", "", "pending")
+			expected := mock.ExpectQuery(regexp.QuoteMeta("FROM tasks AS cli_task "+where+" ORDER BY cli_task.due_date "+direction+", cli_task.id "+direction)+"$").WithArgs("report", "", "pending")
 			switch tc.fail {
 			case "query":
 				expected.WillReturnError(errors.New("query failure"))
@@ -908,6 +908,70 @@ func TestDatabaseCLITaskExport(t *testing.T) {
 			if !strings.Contains(logs.String(), want) {
 				t.Fatalf("unexpected db log: %s", logs.String())
 			}
+		})
+	}
+}
+
+func TestDatabaseCLIDashboard(t *testing.T) {
+	statusQuery := regexp.QuoteMeta("AS cli_status(rank, key) LEFT JOIN tasks AS cli_task ON cli_task.status = cli_status.key")
+	priorityQuery := regexp.QuoteMeta("AS cli_priority(rank, key) LEFT JOIN tasks AS cli_task ON cli_task.priority = cli_priority.key")
+	categoryQuery := regexp.QuoteMeta("SELECT cli_task.category, COUNT(cli_task.id) FROM tasks AS cli_task GROUP BY cli_task.category ORDER BY COUNT(cli_task.id) DESC, cli_task.category")
+	for _, fail := range []string{"", "status", "priority", "category", "scan", "rows"} {
+		name := fail
+		if name == "" {
+			name = "success"
+		}
+		t.Run(name, func(t *testing.T) {
+			conn, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			status := mock.ExpectQuery(statusQuery)
+			if fail == "status" {
+				status.WillReturnError(errors.New("database unavailable"))
+			} else {
+				status.WillReturnRows(countRows("pending", 3, "in_progress", 1, "done", 2))
+				priority := mock.ExpectQuery(priorityQuery)
+				if fail == "priority" {
+					priority.WillReturnError(errors.New("database unavailable"))
+				} else {
+					priority.WillReturnRows(countRows("low", 0, "medium", 4, "high", 2))
+					category := mock.ExpectQuery(categoryQuery)
+					switch fail {
+					case "category":
+						category.WillReturnError(errors.New("database unavailable"))
+					case "scan":
+						category.WillReturnRows(countRows("work", "many"))
+					case "rows":
+						category.WillReturnRows(countRows("work", 4).RowError(0, errors.New("connection lost")))
+					default:
+						category.WillReturnRows(countRows("work", 4, "home", 2))
+					}
+				}
+			}
+			var logs bytes.Buffer
+			got, err := (&database{conn: conn, logs: &logs}).cliDashboard(context.Background(), "req-cli")
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+			if fail != "" {
+				if err == nil {
+					t.Fatal("database failure was not reported")
+				}
+				expectCLIDBLog(t, logs.String(), "dashboard", "error")
+				return
+			}
+			want := dashboard{
+				Total:      6,
+				ByStatus:   []countItem{{"pending", 3}, {"in_progress", 1}, {"done", 2}},
+				ByPriority: []countItem{{"low", 0}, {"medium", 4}, {"high", 2}},
+				ByCategory: []countItem{{"work", 4}, {"home", 2}},
+			}
+			if err != nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("dashboard = %+v, %v", got, err)
+			}
+			expectCLIDBLog(t, logs.String(), "dashboard", "success")
 		})
 	}
 }
