@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -58,7 +59,7 @@ func TestIntegration(t *testing.T) {
 		t.Fatalf("unauthorized status = %d", unauthorized.StatusCode)
 	}
 	username, password := os.Getenv("INITIAL_USERNAME"), os.Getenv("INITIAL_PASSWORD")
-	testCLIIntegration(t, base, username, password)
+	cliToken := testCLIIntegration(t, base, username, password)
 	body, err := json.Marshal(map[string]string{"username": username, "password": password})
 	if err != nil {
 		t.Fatal(err)
@@ -259,6 +260,7 @@ func TestIntegration(t *testing.T) {
 	if none := search(url.Values{"title": {prefix}, "priority": {"low"}, "status": {"pending"}}); none.Total != 0 || len(none.Items) != 0 {
 		t.Fatalf("nonmatching search = %+v", none)
 	}
+	testCLISearchIntegration(t, base, cliToken, cookie, prefix)
 	exportCSV := func(values url.Values) [][]string {
 		status, body := call(http.MethodGet, "/api/web/records/export?"+values.Encode(), "", true)
 		records, err := csv.NewReader(bytes.NewReader(body)).ReadAll()
@@ -403,7 +405,7 @@ func TestIntegration(t *testing.T) {
 	fmt.Println("health, login, authenticated session, rejection, password hash, task create/edit persistence, paginated sorted listing, CSV export, deletion and dashboard indicators verified")
 }
 
-func testCLIIntegration(t *testing.T, base, username, password string) {
+func testCLIIntegration(t *testing.T, base, username, password string) string {
 	t.Helper()
 	command := func(action, token, pass string) ([]byte, error) {
 		cmd := exec.Command("go", "run", "./cli", action)
@@ -435,6 +437,84 @@ func testCLIIntegration(t *testing.T, base, username, password string) {
 		t.Fatalf("missing CLI token status = %d", response.StatusCode)
 	}
 	testCLITaskIntegration(t, base, username, password, strings.TrimSpace(string(token)))
+	return strings.TrimSpace(string(token))
+}
+
+// testCLISearchIntegration compares the authenticated CLI and Web APIs and runs the CLI command.
+func testCLISearchIntegration(t *testing.T, base, token string, cookie *http.Cookie, prefix string) {
+	t.Helper()
+	requestPage := func(path string, values url.Values, bearer string, web bool) (int, taskPage) {
+		req, err := http.NewRequest(http.MethodGet, base+path+"?"+values.Encode(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		if web {
+			req.AddCookie(cookie)
+		}
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		var page taskPage
+		if response.StatusCode == http.StatusOK {
+			if err := json.NewDecoder(response.Body).Decode(&page); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return response.StatusCode, page
+	}
+	for _, tokenValue := range []string{"", "invalid"} {
+		if status, _ := requestPage("/api/cli/records/search", url.Values{}, tokenValue, false); status != http.StatusUnauthorized {
+			t.Fatalf("invalid CLI search token: %d", status)
+		}
+	}
+	if status, _ := requestPage("/api/cli/records/search", url.Values{"priority": {"urgent"}}, token, false); status != http.StatusBadRequest {
+		t.Fatalf("invalid search priority: %d", status)
+	}
+	for _, values := range []url.Values{
+		{"title": {prefix}},
+		{"priority": {"high"}},
+		{"status": {"pending"}},
+		{"title": {prefix}, "priority": {"high"}},
+		{"title": {prefix}, "status": {"pending"}},
+		{"title": {strings.ToLower(prefix)}, "priority": {"high"}, "status": {"pending"}, "sort": {"title"}, "order": {"asc"}},
+		{"title": {prefix}, "priority": {"high"}, "status": {"pending"}, "sort": {"title"}, "page": {"2"}},
+		{"title": {prefix + " %_"}},
+		{"title": {prefix}, "priority": {"low"}},
+	} {
+		webStatus, web := requestPage("/api/web/records/search", values, "", true)
+		cliValues := url.Values{}
+		for key, value := range values {
+			cliValues[key] = value
+		}
+		cliValues.Set("page_size", "5")
+		cliStatus, cli := requestPage("/api/cli/records/search", cliValues, token, false)
+		if webStatus != http.StatusOK || cliStatus != http.StatusOK || !reflect.DeepEqual(web, cli) {
+			t.Fatalf("web/CLI search mismatch for %v: web %+v CLI %+v", values, web, cli)
+		}
+	}
+	command := func(token string, args ...string) (string, string, error) {
+		cmd := exec.Command("go", append([]string{"run", "./cli"}, args...)...)
+		cmd.Env = append(os.Environ(), "TODO_API_URL="+base, "TODO_TOKEN="+token)
+		var out, errs bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &errs
+		err := cmd.Run()
+		return out.String(), errs.String(), err
+	}
+	args := []string{"search", "--title", prefix, "--priority", "high", "--status", "pending", "--page-size", "5", "--sort", "title"}
+	if out, errs, err := command(token, args...); err != nil || !strings.Contains(out, "Page 1 of 2 (6 tasks)") || !strings.Contains(out, prefix) {
+		t.Fatalf("CLI search failed: %v %s %s", err, out, errs)
+	}
+	if out, errs, err := command(token, append(args, "--page", "2")...); err != nil || !strings.Contains(out, "Page 2 of 2 (6 tasks)") {
+		t.Fatalf("CLI search page 2 failed: %v %s %s", err, out, errs)
+	}
+	if _, errs, err := command("", "search"); err == nil || !strings.Contains(errs, "Set TODO_TOKEN.") {
+		t.Fatalf("missing CLI token: %v %s", err, errs)
+	}
 }
 
 // testCLITaskIntegration creates and edits a task through the CLI binary and
