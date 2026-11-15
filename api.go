@@ -34,8 +34,15 @@ type session struct {
 	expires  time.Time
 }
 
+type taskStore interface {
+	createWebTask(context.Context, task, string) (task, error)
+	updateWebTask(context.Context, int64, task, string) (task, error)
+	getWebTask(context.Context, int64, string) (task, error)
+}
+
 type server struct {
 	auth     authenticator
+	tasks    taskStore
 	logs     io.Writer
 	random   io.Reader
 	secure   bool
@@ -61,6 +68,15 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/api/web/session":
 		operation = "session"
 		status = s.session(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/web/records":
+		operation = "create"
+		status = s.saveTask(w, r, id, 0)
+	case r.Method == http.MethodPut && webRecordID(r.URL.Path) > 0:
+		operation = "update"
+		status = s.saveTask(w, r, id, webRecordID(r.URL.Path))
+	case r.Method == http.MethodGet && webRecordID(r.URL.Path) > 0:
+		operation = "get"
+		status = s.getTask(w, r, id, webRecordID(r.URL.Path))
 	case r.Method == http.MethodGet && r.URL.Path == "/":
 		operation, status = "home", http.StatusOK
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -119,26 +135,94 @@ func (s *server) login(w http.ResponseWriter, r *http.Request, id string) int {
 	return http.StatusOK
 }
 
-func (s *server) session(w http.ResponseWriter, r *http.Request) int {
+// currentUser returns the username of a valid, unexpired session cookie.
+func (s *server) currentUser(r *http.Request) (string, bool) {
 	cookie, err := r.Cookie("session")
 	if err != nil {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return http.StatusUnauthorized
+		return "", false
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	user, ok := s.sessions[cookie.Value]
 	if ok && time.Now().After(user.expires) {
 		delete(s.sessions, cookie.Value)
 		ok = false
 	}
-	s.mu.Unlock()
+	return user.username, ok
+}
+
+func (s *server) session(w http.ResponseWriter, r *http.Request) int {
+	username, ok := s.currentUser(r)
 	if !ok {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return http.StatusUnauthorized
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
 	}
+	return writeJSON(w, http.StatusOK, map[string]string{"username": username})
+}
+
+func writeError(w http.ResponseWriter, status int, message string) int {
+	http.Error(w, message, status)
+	return status
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) int {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"username": user.username})
-	return http.StatusOK
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+	return status
+}
+
+// webRecordID extracts a positive task id from /api/web/records/{id}, or returns 0.
+func webRecordID(path string) int64 {
+	value, found := strings.CutPrefix(path, "/api/web/records/")
+	if !found {
+		return 0
+	}
+	id, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || id < 1 {
+		return 0
+	}
+	return id
+}
+
+// saveTask creates a task when id is 0 and updates the given task otherwise.
+func (s *server) saveTask(w http.ResponseWriter, r *http.Request, requestID string, id int64) int {
+	if _, ok := s.currentUser(r); !ok {
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+	}
+	var input task
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&input) != nil {
+		return writeError(w, http.StatusBadRequest, "Invalid request")
+	}
+	input = normalizeTask(input)
+	if problems := validateTask(input); len(problems) > 0 {
+		return writeJSON(w, http.StatusUnprocessableEntity, map[string]map[string]string{"errors": problems})
+	}
+	if id == 0 {
+		saved, err := s.tasks.createWebTask(r.Context(), input, requestID)
+		return respondTask(w, http.StatusCreated, saved, err)
+	}
+	saved, err := s.tasks.updateWebTask(r.Context(), id, input, requestID)
+	return respondTask(w, http.StatusOK, saved, err)
+}
+
+func (s *server) getTask(w http.ResponseWriter, r *http.Request, requestID string, id int64) int {
+	if _, ok := s.currentUser(r); !ok {
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+	}
+	found, err := s.tasks.getWebTask(r.Context(), id, requestID)
+	return respondTask(w, http.StatusOK, found, err)
+}
+
+func respondTask(w http.ResponseWriter, status int, result task, err error) int {
+	if errors.Is(err, errTaskNotFound) {
+		return writeError(w, http.StatusNotFound, "Task not found")
+	}
+	if err != nil {
+		return writeError(w, http.StatusInternalServerError, "Task storage unavailable")
+	}
+	return writeJSON(w, status, result)
 }
 
 func run(getenv func(string) string, open func(string, string) (*sql.DB, error), listen func(string, http.Handler) error, logs io.Writer) error {
@@ -160,7 +244,9 @@ func run(getenv func(string) string, open func(string, string) (*sql.DB, error),
 	if err := db.bootstrap(context.Background(), username, initialPassword, "startup"); err != nil {
 		return err
 	}
-	return listen(":8080", newServer(db, logs, rand.Reader, getenv("COOKIE_SECURE") == "true"))
+	web := newServer(db, logs, rand.Reader, getenv("COOKIE_SECURE") == "true")
+	web.tasks = db
+	return listen(":8080", web)
 }
 
 var start = func() error { return run(os.Getenv, sql.Open, http.ListenAndServe, os.Stdout) }
