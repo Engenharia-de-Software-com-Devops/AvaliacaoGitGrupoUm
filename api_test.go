@@ -35,6 +35,104 @@ func (f *fakeAuth) authenticate(_ context.Context, _, _, requestID string) (bool
 	return f.ok, f.err
 }
 
+func (f *fakeAuth) authenticateCLI(ctx context.Context, username, password, requestID string) (bool, error) {
+	return f.authenticate(ctx, username, password, requestID)
+}
+
+func TestCLIAuthentication(t *testing.T) {
+	auth := &fakeAuth{ok: true}
+	var logs bytes.Buffer
+	s := newServer(auth, &logs, strings.NewReader(strings.Repeat("x", 64)), false)
+	s.cliTokens["old"] = session{username: "alice", expires: time.Now().Add(-time.Hour)}
+	s.cliTokens["active"] = session{username: "alice", expires: time.Now().Add(time.Hour)}
+	response := httptest.NewRecorder()
+	s.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/cli/health", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("CLI health = %d", response.Code)
+	}
+	response = httptest.NewRecorder()
+	s.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/cli/token", strings.NewReader(`{"username":"alice","password":"secret"}`)))
+	var body struct {
+		Token string `json:"token"`
+	}
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &body) != nil || body.Token == "" {
+		t.Fatalf("token response status = %d", response.Code)
+	}
+	if _, ok := s.cliTokens["old"]; ok {
+		t.Fatal("expired CLI token not removed")
+	}
+	if response.Header().Get("Cache-Control") != "no-store" || strings.Contains(logs.String(), body.Token) || strings.Contains(logs.String(), "secret") || !strings.Contains(logs.String(), `"client":"cli","operation":"token","status":"success","request_id":"`+auth.requestID+`"`) {
+		t.Fatalf("unsafe or uncorrelated logs: %s", logs.String())
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/cli/session", nil)
+	request.Header.Set("Authorization", "Bearer "+body.Token)
+	response = httptest.NewRecorder()
+	s.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "alice") {
+		t.Fatalf("CLI session = %d", response.Code)
+	}
+	// A CLI bearer token must not be accepted as a Web session cookie.
+	request = httptest.NewRequest(http.MethodGet, "/api/web/session", nil)
+	request.AddCookie(&http.Cookie{Name: "session", Value: body.Token})
+	response = httptest.NewRecorder()
+	s.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatal("CLI token accepted as Web cookie")
+	}
+}
+
+func TestCLITokenFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		auth       fakeAuth
+		random     string
+		want       int
+	}{
+		{name: "invalid JSON", body: "{", want: http.StatusBadRequest},
+		{name: "missing", body: `{}`, want: http.StatusUnauthorized},
+		{name: "wrong", body: `{"username":"alice","password":"wrong"}`, want: http.StatusUnauthorized},
+		{name: "database failure", body: `{"username":"alice","password":"secret"}`, auth: fakeAuth{err: errors.New("database failure")}, want: http.StatusInternalServerError},
+		{name: "random failure", body: `{"username":"alice","password":"secret"}`, auth: fakeAuth{ok: true}, want: http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			s := newServer(&tc.auth, &logs, strings.NewReader(tc.random), false)
+			response := httptest.NewRecorder()
+			s.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/cli/token", strings.NewReader(tc.body)))
+			if response.Code != tc.want || !strings.Contains(logs.String(), `"client":"cli","operation":"token","status":"error"`) {
+				t.Fatalf("status = %d, logs = %s", response.Code, logs.String())
+			}
+		})
+	}
+}
+
+func TestCLISessionFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, header string
+		expired      bool
+	}{
+		{name: "missing"}, {name: "wrong scheme", header: "Basic valid"},
+		{name: "invalid", header: "Bearer invalid"}, {name: "expired", header: "Bearer valid", expired: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			s := newServer(&fakeAuth{}, &logs, strings.NewReader(""), false)
+			expires := time.Now().Add(time.Hour)
+			if tc.expired {
+				expires = time.Now().Add(-time.Hour)
+			}
+			s.cliTokens["valid"] = session{username: "alice", expires: expires}
+			request := httptest.NewRequest(http.MethodGet, "/api/cli/session", nil)
+			request.Header.Set("Authorization", tc.header)
+			response := httptest.NewRecorder()
+			s.ServeHTTP(response, request)
+			if response.Code != http.StatusUnauthorized || !strings.Contains(logs.String(), `"client":"cli","operation":"session","status":"error"`) {
+				t.Fatalf("status = %d, logs = %s", response.Code, logs.String())
+			}
+		})
+	}
+}
+
 func TestLoginAndSession(t *testing.T) {
 	auth := &fakeAuth{ok: true}
 	var logs bytes.Buffer

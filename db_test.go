@@ -126,6 +126,50 @@ func TestDatabaseAuthenticate(t *testing.T) {
 	}
 }
 
+func TestDatabaseAuthenticateCLI(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("correct"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, password, row string
+		queryErr            error
+		want, wantErr       bool
+	}{
+		{name: "valid", password: "correct", row: string(hash), want: true},
+		{name: "wrong", password: "incorrect", row: string(hash)},
+		{name: "missing user"},
+		{name: "query fails", queryErr: errors.New("database failure"), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			query := mock.ExpectQuery("SELECT password_hash FROM users").WithArgs("alice")
+			if tc.queryErr != nil {
+				query.WillReturnError(tc.queryErr)
+			} else if tc.row == "" {
+				query.WillReturnRows(sqlmock.NewRows([]string{"password_hash"}))
+			} else {
+				query.WillReturnRows(sqlmock.NewRows([]string{"password_hash"}).AddRow(tc.row))
+			}
+			var logs bytes.Buffer
+			got, err := (&database{conn: conn, logs: &logs}).authenticateCLI(context.Background(), "alice", tc.password, "req-cli")
+			if got != tc.want || (err != nil) != tc.wantErr {
+				t.Fatalf("authenticate = %v, %v", got, err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(logs.String(), `"client":"cli","operation":"authenticate"`) || !strings.Contains(logs.String(), `"request_id":"req-cli"`) || (tc.password != "" && strings.Contains(logs.String(), tc.password)) {
+				t.Fatalf("invalid db log: %s", logs.String())
+			}
+		})
+	}
+}
+
 var sampleTask = task{Title: "Write report", Description: "Quarterly numbers", Priority: "high", Status: "pending", DueDate: "2026-11-20", Category: "work"}
 
 func taskRows(t task) *sqlmock.Rows {

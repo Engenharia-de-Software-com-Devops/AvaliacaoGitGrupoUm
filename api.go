@@ -30,6 +30,10 @@ type authenticator interface {
 	authenticate(context.Context, string, string, string) (bool, error)
 }
 
+type cliAuthenticator interface {
+	authenticateCLI(context.Context, string, string, string) (bool, error)
+}
+
 type session struct {
 	username string
 	expires  time.Time
@@ -47,18 +51,21 @@ type taskStore interface {
 }
 
 type server struct {
-	auth     authenticator
-	tasks    taskStore
-	logs     io.Writer
-	random   io.Reader
-	secure   bool
-	mu       sync.Mutex
-	sessions map[string]session
-	sequence atomic.Uint64
+	auth      authenticator
+	cliAuth   cliAuthenticator
+	tasks     taskStore
+	logs      io.Writer
+	random    io.Reader
+	secure    bool
+	mu        sync.Mutex
+	sessions  map[string]session
+	cliTokens map[string]session
+	sequence  atomic.Uint64
 }
 
 func newServer(auth authenticator, logs io.Writer, random io.Reader, secure bool) *server {
-	return &server{auth: auth, logs: logs, random: random, secure: secure, sessions: make(map[string]session)}
+	cliAuth, _ := auth.(cliAuthenticator)
+	return &server{auth: auth, cliAuth: cliAuth, logs: logs, random: random, secure: secure, sessions: make(map[string]session), cliTokens: make(map[string]session)}
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +73,14 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusNotFound
 	operation := "unknown"
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/api/cli/health":
+		operation, status = "health", http.StatusOK
+	case r.Method == http.MethodPost && r.URL.Path == "/api/cli/token":
+		operation = "token"
+		status = s.issueCLIToken(w, r, id)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/cli/session":
+		operation = "session"
+		status = s.cliSession(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/web/health":
 		operation, status = "health", http.StatusOK
 	case r.Method == http.MethodPost && r.URL.Path == "/api/web/login":
@@ -110,7 +125,66 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if status >= 400 {
 		result = "error"
 	}
-	logEvent(s.logs, "api", operation, result, id, "Web request completed")
+	client := "web"
+	if strings.HasPrefix(r.URL.Path, "/api/cli/") {
+		client = "cli"
+	}
+	logClientEvent(s.logs, "api", client, operation, result, id, "Request completed")
+}
+
+func (s *server) issueCLIToken(w http.ResponseWriter, r *http.Request, requestID string) int {
+	var credentials struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	if json.NewDecoder(r.Body).Decode(&credentials) != nil {
+		return writeError(w, http.StatusBadRequest, "Invalid request")
+	}
+	if credentials.Username == "" || credentials.Password == "" {
+		return writeError(w, http.StatusUnauthorized, "Invalid credentials")
+	}
+	ok, err := s.cliAuth.authenticateCLI(r.Context(), credentials.Username, credentials.Password, requestID)
+	if err != nil {
+		return writeError(w, http.StatusInternalServerError, "Authentication unavailable")
+	}
+	if !ok {
+		return writeError(w, http.StatusUnauthorized, "Invalid credentials")
+	}
+	random := make([]byte, 32)
+	if _, err := io.ReadFull(s.random, random); err != nil {
+		return writeError(w, http.StatusInternalServerError, "Authentication unavailable")
+	}
+	token := hex.EncodeToString(random)
+	expires := time.Now().Add(12 * time.Hour)
+	s.mu.Lock()
+	for key, existing := range s.cliTokens {
+		if time.Now().After(existing.expires) {
+			delete(s.cliTokens, key)
+		}
+	}
+	s.cliTokens[token] = session{username: credentials.Username, expires: expires}
+	s.mu.Unlock()
+	w.Header().Set("Cache-Control", "no-store")
+	return writeJSON(w, http.StatusOK, map[string]string{"token": token})
+}
+
+func (s *server) cliSession(w http.ResponseWriter, r *http.Request) int {
+	token, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !found || token == "" {
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+	}
+	s.mu.Lock()
+	user, ok := s.cliTokens[token]
+	if ok && time.Now().After(user.expires) {
+		delete(s.cliTokens, token)
+		ok = false
+	}
+	s.mu.Unlock()
+	if !ok {
+		return writeError(w, http.StatusUnauthorized, "Unauthorized")
+	}
+	return writeJSON(w, http.StatusOK, map[string]string{"username": user.username})
 }
 
 func (s *server) login(w http.ResponseWriter, r *http.Request, id string) int {

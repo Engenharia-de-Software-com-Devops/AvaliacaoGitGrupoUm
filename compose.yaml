@@ -27,6 +27,18 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
+  cli:
+    build: .
+    profiles: ["cli"]
+    entrypoint: ["go", "run", "./cli"]
+    environment:
+      TODO_API_URL: http://app:8080
+      TODO_USERNAME: ${TODO_USERNAME:-}
+      TODO_PASSWORD: ${TODO_PASSWORD:-}
+      TODO_TOKEN: ${TODO_TOKEN:-}
+    depends_on:
+      app:
+        condition: service_started
   tests:
     build: .
     profiles: ["test"]
